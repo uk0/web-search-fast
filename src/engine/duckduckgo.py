@@ -62,70 +62,59 @@ class DuckDuckGoSearchEngine(BaseSearchEngine):
         """Override to use HTML-lite version which is more reliable."""
         url = self.build_search_url(query)
         await self._navigate(page, url, retries=1, timeout=10_000)
-        await page.wait_for_timeout(300)
         return await self.parse_results(page, max_results)
 
     async def parse_results(self, page: Page, max_results: int = 10) -> list[SearchResult]:
-        """Parse search results from DuckDuckGo SERP."""
-        results: list[SearchResult] = []
+        """Parse search results from DuckDuckGo SERP via a single JS evaluation."""
+        raw: list[dict] = await page.evaluate("""() => {
+            // Try selector sets in priority order
+            let elements = Array.from(document.querySelectorAll('div.result'));
+            if (!elements.length)
+                elements = Array.from(document.querySelectorAll('article[data-testid="result"]'));
+            if (!elements.length)
+                elements = Array.from(document.querySelectorAll('div.results div.result__body'));
 
-        # html.duckduckgo.com selectors
-        elements = await page.query_selector_all("div.result")
-        if not elements:
-            # Fallback: JS version selectors
-            elements = await page.query_selector_all('article[data-testid="result"]')
-        if not elements:
-            elements = await page.query_selector_all("div.results div.result__body")
-        if not elements:
+            return elements.map(el => {
+                // Title + href: try selectors in order
+                const linkEl = el.querySelector('a.result__a')
+                    || el.querySelector('a[data-testid="result-title-a"]')
+                    || el.querySelector('h2 a');
+                const title = linkEl ? (linkEl.textContent || '').trim() : '';
+                const href  = linkEl ? (linkEl.getAttribute('href') || '') : '';
+
+                // Snippet: try selectors in order
+                const snippetEl = el.querySelector('a.result__snippet')
+                    || el.querySelector('div[data-result="snippet"] span')
+                    || el.querySelector('span[data-testid="result-snippet"]')
+                    || el.querySelector('span.result__snippet');
+                const snippet = snippetEl ? (snippetEl.textContent || '').trim() : '';
+
+                return { title, href, snippet };
+            });
+        }""")
+
+        if not raw:
             logger.warning("[duckduckgo] no result elements found on page")
             await self._dump_page_diagnostics(page)
-            return results
+            return []
 
-        logger.info("[duckduckgo] found %d result elements", len(elements))
+        logger.info("[duckduckgo] found %d result elements", len(raw))
 
-        for idx, element in enumerate(elements):
+        results: list[SearchResult] = []
+        for idx, item in enumerate(raw):
             if len(results) >= max_results:
                 break
-            try:
-                # html.duckduckgo.com selectors
-                link_el = await element.query_selector("a.result__a")
-                if not link_el:
-                    link_el = await element.query_selector('a[data-testid="result-title-a"]')
-                if not link_el:
-                    link_el = await element.query_selector("h2 a")
-                if not link_el:
-                    logger.debug("[duckduckgo] element #%d: no link found, skipping", idx)
-                    continue
-
-                title = (await link_el.inner_text()).strip()
-                raw_href = await link_el.get_attribute("href")
-                url = _resolve_ddg_url(raw_href)
-
-                if not title or not url:
-                    logger.debug("[duckduckgo] element #%d: empty title=%r or url=%r (raw=%r), skipping",
-                                 idx, title[:30] if title else None, url, raw_href[:80] if raw_href else None)
-                    continue
-
-                # Extract snippet
-                snippet = ""
-                snippet_el = await element.query_selector("a.result__snippet")
-                if not snippet_el:
-                    snippet_el = await element.query_selector('div[data-result="snippet"] span')
-                if not snippet_el:
-                    snippet_el = await element.query_selector(
-                        'span[data-testid="result-snippet"]'
-                    )
-                if not snippet_el:
-                    snippet_el = await element.query_selector("span.result__snippet")
-                if snippet_el:
-                    snippet = (await snippet_el.inner_text()).strip()
-
-                results.append(SearchResult(title=title, url=url, snippet=snippet))
-            except Exception:
+            title = item.get("title", "")
+            href = item.get("href", "")
+            snippet = item.get("snippet", "")
+            url = _resolve_ddg_url(href)
+            if not title or not url:
                 logger.debug(
-                    "[duckduckgo] element #%d: parse failed, skipping", idx, exc_info=True
+                    "[duckduckgo] element #%d: empty title=%r or url=%r (raw=%r), skipping",
+                    idx, title[:30] if title else None, url, href[:80] if href else None,
                 )
                 continue
+            results.append(SearchResult(title=title, url=url, snippet=snippet))
 
-        logger.info("[duckduckgo] extracted %d valid results from %d elements", len(results), len(elements))
+        logger.info("[duckduckgo] extracted %d valid results from %d elements", len(results), len(raw))
         return results

@@ -58,6 +58,9 @@ export interface SearchLog {
   user_agent: string | null
   status_code: number | null
   elapsed_ms: number | null
+  tool_name: string | null
+  request_body: string | null
+  response_body: string | null
   created_at: string
 }
 

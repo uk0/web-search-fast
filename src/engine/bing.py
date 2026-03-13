@@ -54,44 +54,36 @@ class BingSearchEngine(BaseSearchEngine):
 
     async def parse_results(self, page: Page, max_results: int = 10) -> list[SearchResult]:
         """Parse search results from Bing SERP."""
-        results: list[SearchResult] = []
+        raw: list[dict] = await page.evaluate("""() => {
+            let items = Array.from(document.querySelectorAll('li.b_algo'));
+            if (!items.length) {
+                items = Array.from(document.querySelectorAll('#b_results li.b_algo'));
+            }
+            return items.map(el => {
+                const linkEl = el.querySelector('h2 a');
+                const title = linkEl ? linkEl.innerText.trim() : '';
+                const url = linkEl ? (linkEl.getAttribute('href') || '') : '';
+                const snippetEl = el.querySelector('div.b_caption p') || el.querySelector('p');
+                const snippet = snippetEl ? snippetEl.innerText.trim() : '';
+                return { title, url, snippet };
+            });
+        }""")
 
-        elements = await page.query_selector_all("li.b_algo")
-        if not elements:
-            # Fallback selectors
-            elements = await page.query_selector_all("#b_results li.b_algo")
-        if not elements:
+        if not raw:
             logger.warning("No Bing result elements found on page")
             await self._dump_page_diagnostics(page)
-            return results
+            return []
 
-        for element in elements:
+        results: list[SearchResult] = []
+        for item in raw:
             if len(results) >= max_results:
                 break
-            try:
-                # Extract title and URL from h2 > a
-                link_el = await element.query_selector("h2 a")
-                if not link_el:
-                    continue
-                title = (await link_el.inner_text()).strip()
-                url = await link_el.get_attribute("href")
-                if not title or not url or not url.startswith("http"):
-                    continue
-
-                # Decode Bing tracking URLs to real URLs
-                url = _decode_bing_url(url)
-
-                # Extract snippet
-                snippet = ""
-                snippet_el = await element.query_selector("div.b_caption p")
-                if not snippet_el:
-                    snippet_el = await element.query_selector("p")
-                if snippet_el:
-                    snippet = (await snippet_el.inner_text()).strip()
-
-                results.append(SearchResult(title=title, url=url, snippet=snippet))
-            except Exception:
-                logger.debug("Failed to parse a Bing result element, skipping", exc_info=True)
+            title = item.get("title", "")
+            url = item.get("url", "")
+            snippet = item.get("snippet", "")
+            if not title or not url or not url.startswith("http"):
                 continue
+            url = _decode_bing_url(url)
+            results.append(SearchResult(title=title, url=url, snippet=snippet))
 
         return results

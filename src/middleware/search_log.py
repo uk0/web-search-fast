@@ -1,6 +1,7 @@
 """Search log middleware — records ALL MCP requests to the database."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -73,11 +74,11 @@ class SearchLogMiddleware:
         finally:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             try:
-                await self._log_request(
+                asyncio.create_task(self._log_request(
                     request, request_body, response_chunks, status_code, elapsed_ms,
-                )
+                ))
             except Exception as e:
-                logger.debug("Failed to log request: %s", e)
+                logger.debug("Failed to schedule log request: %s", e)
 
     async def _log_request(
         self,
@@ -93,6 +94,11 @@ class SearchLogMiddleware:
 
         request_body_str = request_body.decode("utf-8", errors="replace")
         response_body_str = b"".join(response_chunks).decode("utf-8", errors="replace")
+        # Truncate large bodies to avoid bloating the database
+        if len(request_body_str) > 10_000:
+            request_body_str = request_body_str[:10_000] + "... (truncated)"
+        if len(response_body_str) > 10_000:
+            response_body_str = response_body_str[:10_000] + "... (truncated)"
 
         # Parse MCP JSON-RPC to extract tool name, query, engine
         query_text = ""

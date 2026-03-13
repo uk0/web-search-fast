@@ -31,52 +31,29 @@ class BaseSearchEngine(abc.ABC):
         try:
             url = page.url
             title = await page.title()
-            html = await page.content()
-            body_len = len(html)
-            # Log key identifiers to help debug
+            # Lightweight summary always logged
             logger.warning(
-                "[%s] DIAGNOSTIC — url=%s title=%r body_len=%d",
-                self.name, url, title, body_len,
+                "[%s] DIAGNOSTIC — url=%s title=%r", self.name, url, title,
             )
-            # Dump first 2000 chars of HTML for structure inspection
-            logger.warning(
-                "[%s] DIAGNOSTIC — HTML head (2000 chars):\n%s",
-                self.name, html[:2000],
-            )
-            # List body's direct children tags + classes via JS
-            try:
-                children_info = await page.evaluate("""() => {
-                    const body = document.body;
-                    if (!body) return 'NO BODY';
-                    return Array.from(body.children).slice(0, 20).map(el => {
-                        const tag = el.tagName.toLowerCase();
-                        const cls = el.className ? '.' + el.className.split(' ').join('.') : '';
-                        const id = el.id ? '#' + el.id : '';
-                        const childCount = el.children.length;
-                        return `${tag}${id}${cls} (${childCount} children)`;
-                    }).join('\\n');
-                }""")
-                logger.warning(
-                    "[%s] DIAGNOSTIC — body children:\n%s",
-                    self.name, children_info,
-                )
-            except Exception as js_exc:
-                logger.warning("[%s] DIAGNOSTIC — JS eval failed: %s", self.name, js_exc)
-            # Check for common blocking indicators
-            lower_html = html[:10000].lower()
-            if "captcha" in lower_html or "/sorry/" in url:
+            # Check for common blocking indicators via JS (single eval, no full HTML fetch)
+            block_info = await page.evaluate("""() => {
+                const url = location.href;
+                const html = document.documentElement.innerHTML.substring(0, 5000).toLowerCase();
+                return {
+                    captcha: html.includes('captcha') || url.includes('/sorry/'),
+                    consent: html.includes('consent') || html.substring(0, 3000).includes('cookie'),
+                    bodyLen: document.documentElement.innerHTML.length,
+                    childTags: Array.from(document.body?.children || []).slice(0, 10).map(
+                        el => el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')
+                    ).join(', ')
+                };
+            }""")
+            logger.warning("[%s] DIAGNOSTIC — body_len=%d children=[%s]",
+                           self.name, block_info.get("bodyLen", 0), block_info.get("childTags", ""))
+            if block_info.get("captcha"):
                 logger.warning("[%s] DIAGNOSTIC — CAPTCHA/block detected", self.name)
-            if "consent" in lower_html or "cookie" in lower_html[:3000]:
+            if block_info.get("consent"):
                 logger.warning("[%s] DIAGNOSTIC — consent/cookie page may be blocking", self.name)
-            # Log a sample of the body around result areas
-            for marker in ["id=\"rso\"", "class=\"g\"", "b_algo", "result__a", "data-testid",
-                           "web_regular_results", "results--main", "div.result"]:
-                pos = html.find(marker)
-                if pos >= 0:
-                    logger.warning(
-                        "[%s] DIAGNOSTIC — found '%s' at pos %d: ...%s...",
-                        self.name, marker, pos, html[max(0, pos - 50):pos + 200].replace("\n", " "),
-                    )
         except Exception as exc:
             logger.warning("[%s] DIAGNOSTIC dump failed: %s", self.name, exc)
 
@@ -117,7 +94,6 @@ class BaseSearchEngine(abc.ABC):
         url = self.build_search_url(query)
         logger.info("[%s] search start: query=%r max_results=%d", self.name, query[:80], max_results)
         await self._navigate(page, url)
-        await page.wait_for_timeout(1000)
         results = await self.parse_results(page, max_results)
         elapsed = (time.monotonic() - t0) * 1000
         logger.info("[%s] search done in %.0fms — %d results", self.name, elapsed, len(results))

@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS ip_bans (
 CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_search_logs_ip ON search_logs(ip_address);
 CREATE INDEX IF NOT EXISTS idx_search_logs_key ON search_logs(api_key_id);
+CREATE INDEX IF NOT EXISTS idx_search_logs_engine ON search_logs(engine);
+CREATE INDEX IF NOT EXISTS idx_search_logs_elapsed ON search_logs(elapsed_ms);
 """
 
 

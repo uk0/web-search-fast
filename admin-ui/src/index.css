@@ -1,32 +1,233 @@
 @import "tailwindcss";
 
 :root {
-  --background: 0 0% 100%;
-  --foreground: 222.2 84% 4.9%;
-  --card: 0 0% 100%;
-  --card-foreground: 222.2 84% 4.9%;
-  --primary: 222.2 47.4% 11.2%;
-  --primary-foreground: 210 40% 98%;
-  --secondary: 210 40% 96.1%;
-  --secondary-foreground: 222.2 47.4% 11.2%;
-  --muted: 210 40% 96.1%;
-  --muted-foreground: 215.4 16.3% 46.9%;
-  --accent: 210 40% 96.1%;
-  --accent-foreground: 222.2 47.4% 11.2%;
-  --destructive: 0 84.2% 60.2%;
-  --destructive-foreground: 210 40% 98%;
-  --border: 214.3 31.8% 91.4%;
-  --input: 214.3 31.8% 91.4%;
-  --ring: 222.2 84% 4.9%;
-  --radius: 0.5rem;
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-bg-heavy: rgba(255, 255, 255, 0.85);
+  --glass-border: rgba(255, 255, 255, 0.45);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.06);
+  --glass-blur: 24px;
+  --glass-saturate: 180%;
+  --glass-radius: 16px;
+  --glass-radius-sm: 12px;
+  --glass-radius-xs: 8px;
+
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #aeaeb2;
+
+  --accent-blue: #007aff;
+  --accent-green: #34c759;
+  --accent-orange: #ff9500;
+  --accent-red: #ff3b30;
+  --accent-purple: #af52de;
+  --accent-teal: #5ac8fa;
+  --accent-indigo: #5856d6;
+
+  --mesh-1: #e8f0fe;
+  --mesh-2: #f3e8fd;
+  --mesh-3: #e8fdf5;
+  --mesh-4: #fef3e8;
 }
 
 * {
-  border-color: hsl(var(--border));
+  border-color: var(--glass-border);
 }
 
 body {
-  background-color: hsl(var(--background));
-  color: hsl(var(--foreground));
-  font-family: system-ui, -apple-system, sans-serif;
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Mesh gradient background */
+.mesh-bg {
+  background:
+    radial-gradient(ellipse at 0% 0%, var(--mesh-1) 0%, transparent 50%),
+    radial-gradient(ellipse at 100% 0%, var(--mesh-2) 0%, transparent 50%),
+    radial-gradient(ellipse at 100% 100%, var(--mesh-3) 0%, transparent 50%),
+    radial-gradient(ellipse at 0% 100%, var(--mesh-4) 0%, transparent 50%),
+    #f5f5f7;
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* Glass panel */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+.glass:hover {
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08);
+}
+
+.glass-heavy {
+  background: var(--glass-bg-heavy);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-sidebar {
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border-right: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.glass-input {
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: var(--glass-radius-xs);
+  transition: all 0.2s ease;
+}
+
+.glass-input:focus {
+  background: rgba(255, 255, 255, 0.85);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
+  outline: none;
+}
+
+.glass-btn {
+  border-radius: var(--glass-radius-xs);
+  font-weight: 500;
+  transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  cursor: pointer;
+}
+
+.glass-btn:active {
+  transform: scale(0.97);
+}
+
+.glass-btn-primary {
+  background: var(--accent-blue);
+  color: white;
+  border: none;
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.3);
+}
+
+.glass-btn-primary:hover {
+  background: #0071e3;
+  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.4);
+}
+
+.glass-btn-danger {
+  background: var(--accent-red);
+  color: white;
+  border: none;
+  box-shadow: 0 2px 8px rgba(255, 59, 48, 0.3);
+}
+
+.glass-btn-danger:hover {
+  background: #e8342a;
+  box-shadow: 0 4px 12px rgba(255, 59, 48, 0.4);
+}
+
+.glass-btn-ghost {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text-secondary);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.glass-btn-ghost:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+/* Glass table */
+.glass-table {
+  width: 100%;
+  font-size: 0.875rem;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.glass-table thead tr {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.glass-table thead th {
+  padding: 0.75rem 1rem;
+  text-align: left;
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.8125rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.glass-table tbody tr {
+  transition: background 0.15s ease;
+}
+
+.glass-table tbody tr:hover {
+  background: rgba(0, 122, 255, 0.04);
+}
+
+.glass-table tbody td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.glass-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Badge / pill */
+.glass-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.625rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  backdrop-filter: blur(8px);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 500px; }
+}
+
+.animate-slide-down {
+  animation: slideDown 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+  overflow: hidden;
 }

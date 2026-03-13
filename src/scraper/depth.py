@@ -11,6 +11,9 @@ from src.scraper.parser import extract_links, extract_main_content
 
 logger = logging.getLogger(__name__)
 
+# Limit concurrent depth-crawl fetches to avoid overwhelming the browser pool
+_DEPTH_CONCURRENCY = 5
+
 
 async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
     """Fetch a single page and return its HTML content.
@@ -67,14 +70,26 @@ async def crawl_results(
     depth: int = 1,
     timeout: int = 30,
 ) -> list[SearchResult]:
-    """Orchestrate multi-depth crawling with concurrency."""
+    """Orchestrate multi-depth crawling with concurrency limiter."""
     if depth <= 1:
         return results
 
+    sem = asyncio.Semaphore(_DEPTH_CONCURRENCY)
+
+    async def _limited(coro):
+        async with sem:
+            return await coro
+
     if depth == 2:
-        tasks = [enrich_with_content(pool, r, timeout) for r in results]
+        tasks = [_limited(enrich_with_content(pool, r, timeout)) for r in results]
     else:  # depth == 3
-        tasks = [enrich_with_sub_links(pool, r, timeout) for r in results]
+        tasks = [_limited(enrich_with_sub_links(pool, r, timeout)) for r in results]
 
     enriched = await asyncio.gather(*tasks, return_exceptions=True)
-    return [r for r in enriched if isinstance(r, SearchResult)]
+    successful = []
+    for r in enriched:
+        if isinstance(r, SearchResult):
+            successful.append(r)
+        elif isinstance(r, Exception):
+            logger.warning("Depth crawl enrichment failed: %s", r)
+    return successful

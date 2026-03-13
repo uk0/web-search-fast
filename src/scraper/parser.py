@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from markdownify import markdownify
 
 
-def extract_main_content(html: str) -> str:
-    """Extract main readable content from HTML, return as plain text."""
+def _get_main_content_element(html: str) -> Tag | None:
+    """Parse HTML, strip non-content tags, and return the main content element."""
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove non-content elements
     for tag in soup.find_all(["script", "style", "nav", "header", "footer", "aside", "iframe", "noscript"]):
         tag.decompose()
 
-    # Try to find main content area
-    main = (
+    return (
         soup.find("main")
         or soup.find("article")
         or soup.find("div", {"role": "main"})
@@ -22,31 +20,20 @@ def extract_main_content(html: str) -> str:
         or soup.body
     )
 
+
+def extract_main_content(html: str) -> str:
+    """Extract main readable content from HTML, return as plain text."""
+    main = _get_main_content_element(html)
     if main is None:
         return ""
-
     return main.get_text(separator="\n", strip=True)
 
 
 def extract_main_content_markdown(html: str) -> str:
     """Extract main readable content from HTML, return as markdown."""
-    soup = BeautifulSoup(html, "lxml")
-
-    for tag in soup.find_all(["script", "style", "nav", "header", "footer", "aside", "iframe", "noscript"]):
-        tag.decompose()
-
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.find("div", {"role": "main"})
-        or soup.find("div", {"id": "content"})
-        or soup.find("div", {"class": "content"})
-        or soup.body
-    )
-
+    main = _get_main_content_element(html)
     if main is None:
         return ""
-
     return markdownify(str(main), strip=["img"]).strip()
 
 

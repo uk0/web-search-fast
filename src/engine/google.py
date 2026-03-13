@@ -26,9 +26,9 @@ class GoogleSearchEngine(BaseSearchEngine):
 
     async def search(self, page: Page, query: str, max_results: int = 10) -> list[SearchResult]:
         """Override to warm up Google session before searching."""
-        # Visit Google homepage first to establish cookies (fast, no retry)
+        # Visit Google homepage first to establish cookies (fast, short timeout)
         try:
-            await self._navigate(page, "https://www.google.com/", retries=0, timeout=8_000)
+            await self._navigate(page, "https://www.google.com/", retries=0, timeout=5_000)
             await self._handle_consent(page)
         except Exception:
             logger.debug("Google homepage warm-up failed, proceeding anyway")
@@ -37,10 +37,7 @@ class GoogleSearchEngine(BaseSearchEngine):
         url = self.build_search_url(query, 1)
         await self._navigate(page, url, retries=1, timeout=10_000)
 
-        # Wait for JS rendering
-        await page.wait_for_timeout(500)
-
-        # Handle consent again in case it appears on SERP
+        # Handle consent if it appears on SERP
         await self._handle_consent(page)
 
         return await self.parse_results(page, max_results)
@@ -59,7 +56,8 @@ class GoogleSearchEngine(BaseSearchEngine):
                 btn = await page.query_selector(selector)
                 if btn:
                     await btn.click()
-                    await page.wait_for_timeout(500)
+                    # Brief wait for consent to process
+                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
                     logger.info("[google] Clicked consent button: %s", selector)
                     return
         except Exception:

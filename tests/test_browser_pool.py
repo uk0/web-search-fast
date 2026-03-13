@@ -29,7 +29,7 @@ def mock_camoufox(mock_browser):
 class TestBrowserPoolInit:
     def test_defaults(self):
         pool = BrowserPool()
-        assert pool._pool_size == 5
+        assert pool._pool_size == 10
         assert pool._headless is True
         assert pool._started is False
 

@@ -313,27 +313,26 @@ async def get_analytics(hours: int = 24) -> dict:
     db = await get_db()
     interval = f"-{hours} hours"
 
-    timeline_rows = await db.execute_fetchall(
-        "SELECT strftime('%Y-%m-%d %H:00', created_at) as hour, "
-        "AVG(elapsed_ms) as avg_ms, COUNT(*) as count "
+    # Single query: fetch all elapsed_ms values grouped by hour for p95 calculation
+    all_rows = await db.execute_fetchall(
+        "SELECT strftime('%Y-%m-%d %H:00', created_at) as hour, elapsed_ms "
         "FROM search_logs "
         "WHERE created_at >= datetime('now', ?) AND elapsed_ms IS NOT NULL "
-        "GROUP BY hour ORDER BY hour",
+        "ORDER BY hour, elapsed_ms",
         (interval,),
     )
+    # Group by hour and compute avg, p95, count in Python
+    from collections import defaultdict
+    hour_buckets: dict[str, list[int]] = defaultdict(list)
+    for r in all_rows:
+        hour_buckets[r["hour"]].append(r["elapsed_ms"])
+
     timeline = []
-    for r in timeline_rows:
-        hour = r["hour"]
-        avg_ms = round(r["avg_ms"] or 0, 1)
-        count = r["count"]
-        p95_rows = await db.execute_fetchall(
-            "SELECT elapsed_ms FROM search_logs "
-            "WHERE strftime('%Y-%m-%d %H:00', created_at) = ? AND elapsed_ms IS NOT NULL "
-            "ORDER BY elapsed_ms",
-            (hour,),
-        )
-        values = [row["elapsed_ms"] for row in p95_rows]
-        p95_ms = values[int(len(values) * 0.95)] if values else 0
+    for hour in sorted(hour_buckets):
+        values = hour_buckets[hour]
+        count = len(values)
+        avg_ms = round(sum(values) / count, 1) if count else 0
+        p95_ms = values[int(count * 0.95)] if count else 0
         timeline.append({"hour": hour, "avg_ms": avg_ms, "p95_ms": p95_ms, "count": count})
 
     engine_rows = await db.execute_fetchall(
