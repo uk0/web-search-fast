@@ -53,8 +53,11 @@ ENV MCP_HOST="0.0.0.0" \
     MCP_PORT="8897" \
     MCP_TRANSPORT="http" \
     BROWSER_POOL_SIZE="3" \
+    BROWSER_PROXY="" \
+    BROWSER_PROXY_LIST_FILE="" \
     PYTHONUNBUFFERED="1"
 
+# SOCKS5 bridge uses local ports 19100+ for proxy auth relay
 EXPOSE 8897
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

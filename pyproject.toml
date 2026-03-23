@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "web-search-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "High-performance web search to JSON/Markdown service powered by Camoufox and FastAPI"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.115.0",
+    "fastapi>=0.128.0",
     "uvicorn[standard]>=0.34.0",
     "camoufox[geoip]>=0.4.11",
-    "playwright>=1.49.0",
+    "playwright>=1.58.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
     "markdownify>=0.14.0",
@@ -43,6 +43,10 @@ web-search-mcp = "src.mcp_server:main"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: requires real browser + network (deselect with '-m not integration')",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 target-version = "py310"

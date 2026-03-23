@@ -10,7 +10,7 @@ from starlette.testclient import TestClient
 from src.admin.database import close_db, init_db
 from src.admin.routes import admin_routes
 
-ADMIN_TOKEN = "test-admin-token-123"
+ADMIN_TOKEN = "test-admin-tkn"  # noqa: S105 — test-only value
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +109,120 @@ class TestAPIKeysEndpoints:
             assert resp.status_code == 400
 
 
-# PLACEHOLDER_MORE_TESTS
+class TestProxiesEndpoints:
+    def test_import_and_list_proxies(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://user:pass@1.2.3.4:1080", "http://5.6.7.8:8080"]},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["added"] == 2
+
+            resp = client.get("/admin/api/proxies", headers=auth_headers)
+            assert resp.status_code == 200
+            proxies = resp.json()
+            assert len(proxies) == 2
+
+    def test_import_duplicates_ignored(self, client, auth_headers):
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://dup@host:1080"]},
+                headers=auth_headers,
+            )
+            # Import same URL again
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://dup@host:1080"]},
+                headers=auth_headers,
+            )
+            resp = client.get("/admin/api/proxies", headers=auth_headers)
+            proxies = resp.json()
+            assert len(proxies) == 1
+
+    def test_proxy_stats(self, client, auth_headers):
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://a@h:1080", "http://b:8080"]},
+                headers=auth_headers,
+            )
+            resp = client.get("/admin/api/proxies/stats", headers=auth_headers)
+            assert resp.status_code == 200
+            stats = resp.json()
+            assert stats["total"] == 2
+            assert stats["active"] == 2
+            assert stats["inactive"] == 0
+
+    def test_toggle_proxy(self, client, auth_headers):
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://toggle@h:1080"]},
+                headers=auth_headers,
+            )
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            proxy_id = proxies[0]["id"]
+
+            # Disable
+            resp = client.patch(
+                f"/admin/api/proxies/{proxy_id}",
+                json={"is_active": False},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            assert proxies[0]["is_active"] is False
+
+    def test_delete_proxy(self, client, auth_headers):
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://del@h:1080"]},
+                headers=auth_headers,
+            )
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            proxy_id = proxies[0]["id"]
+
+            resp = client.delete(f"/admin/api/proxies/{proxy_id}", headers=auth_headers)
+            assert resp.status_code == 200
+
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            assert len(proxies) == 0
+
+    def test_import_mixed_schemes(self, client, auth_headers):
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": [
+                    "socks5h://u:p@h:1080",
+                    "socks5://u:p@h:1081",
+                    "http://h:8080",
+                    "https://h:8443",
+                ]},
+                headers=auth_headers,
+            )
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            schemes = {p["scheme"] for p in proxies}
+            assert schemes == {"socks5h", "socks5", "http", "https"}
+
+    def test_import_empty_list(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.post(
+                "/admin/api/proxies",
+                json={"urls": []},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 400
+
+    def test_delete_nonexistent_proxy(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.delete("/admin/api/proxies/99999", headers=auth_headers)
+            assert resp.status_code == 404
 
 
 class TestSystemEndpoint:

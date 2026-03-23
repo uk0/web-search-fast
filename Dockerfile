@@ -16,10 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ patchelf ccache \
     && rm -rf /var/lib/apt/lists/*
 
-# PyPI mirror (avoids VPN/SSL interception issues with pypi.org)
-ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    PIP_TRUSTED_HOST=mirrors.aliyun.com
-
 COPY pyproject.toml ./
 COPY src/ ./src/
 
@@ -105,10 +101,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy Nuitka compiled binary
 COPY --from=builder /build/mcp_server.dist/ /app/bin/
 
-# PyPI mirror for runtime stage
-ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    PIP_TRUSTED_HOST=mirrors.aliyun.com
-
 # Fetch Camoufox browser binary (needs pip camoufox for the fetch command)
 RUN pip install --no-cache-dir "camoufox[geoip]>=0.4.11" && \
     python -m camoufox fetch
@@ -117,8 +109,11 @@ ENV MCP_HOST="0.0.0.0" \
     MCP_PORT="8897" \
     MCP_TRANSPORT="http" \
     BROWSER_POOL_SIZE="3" \
+    BROWSER_PROXY="" \
+    BROWSER_PROXY_LIST_FILE="" \
     PYTHONUNBUFFERED="1"
 
+# SOCKS5 bridge uses local ports 19100+ for proxy auth relay
 EXPOSE 8897
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

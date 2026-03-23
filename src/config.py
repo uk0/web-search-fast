@@ -18,8 +18,8 @@ class OutputFormat(str, Enum):
 
 
 class BrowserConfig(BaseModel):
-    pool_size: int = Field(default=10, ge=1, le=50, description="Initial browser concurrency slots")
-    max_pool_size: int = Field(default=30, ge=1, le=50, description="Max auto-scaled concurrency slots")
+    pool_size: int = Field(default=30, ge=1, le=100, description="Initial browser concurrency slots")
+    max_pool_size: int = Field(default=90, ge=1, le=100, description="Max auto-scaled concurrency slots")
     headless: bool = Field(default=True)
     timeout: int = Field(default=30, ge=5, le=120, description="Page load timeout in seconds")
     geoip: bool = Field(default=True, description="Enable GeoIP spoofing based on real IP")
@@ -32,6 +32,7 @@ class BrowserConfig(BaseModel):
     fonts: list[str] = Field(default_factory=list, description="Custom font list for fingerprint")
     block_webgl: bool = Field(default=False, description="Block WebGL fingerprinting")
     addons: list[str] = Field(default_factory=list, description="Firefox addon paths to load")
+    proxy_list_file: str = Field(default="", description="Path to proxy list file (one per line)")
 
 
 class AppConfig(BaseModel):
@@ -65,6 +66,8 @@ def get_config() -> AppConfig:
         browser_kwargs["block_webgl"] = True
     if addons := os.environ.get("BROWSER_ADDONS"):
         browser_kwargs["addons"] = [a.strip() for a in addons.split(",") if a.strip()]
+    if proxy_list_file := os.environ.get("BROWSER_PROXY_LIST"):
+        browser_kwargs["proxy_list_file"] = proxy_list_file
     return AppConfig(browser=BrowserConfig(**browser_kwargs))
 
 

@@ -65,3 +65,23 @@ class PaginatedResponse(BaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 20
+
+
+class ProxyCreate(BaseModel):
+    urls: list[str] = Field(..., min_length=1)
+    scheme: str = Field(default="", description="Default scheme for URLs without prefix (socks5h, socks5, http, https)")
+
+class ProxyOut(BaseModel):
+    id: int
+    url: str
+    scheme: str
+    is_active: bool
+    fail_count: int
+    last_used_at: str | None = None
+    created_at: str
+
+class ProxyStats(BaseModel):
+    total: int = 0
+    active: int = 0
+    inactive: int = 0
+    total_failures: int = 0

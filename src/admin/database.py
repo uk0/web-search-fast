@@ -52,6 +52,16 @@ CREATE INDEX IF NOT EXISTS idx_search_logs_ip ON search_logs(ip_address);
 CREATE INDEX IF NOT EXISTS idx_search_logs_key ON search_logs(api_key_id);
 CREATE INDEX IF NOT EXISTS idx_search_logs_engine ON search_logs(engine);
 CREATE INDEX IF NOT EXISTS idx_search_logs_elapsed ON search_logs(elapsed_ms);
+
+CREATE TABLE IF NOT EXISTS proxies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL UNIQUE,
+    scheme TEXT NOT NULL DEFAULT 'socks5h',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

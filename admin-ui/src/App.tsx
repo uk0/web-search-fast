@@ -4,8 +4,9 @@ import Dashboard from '@/pages/Dashboard'
 import SearchHistory from '@/pages/SearchHistory'
 import IPMonitor from '@/pages/IPMonitor'
 import APIKeys from '@/pages/APIKeys'
+import ProxyManager from '@/pages/ProxyManager'
 import Login from '@/pages/Login'
-import { LayoutDashboard, Search, ShieldBan, Key, LogOut, Globe } from 'lucide-react'
+import { LayoutDashboard, Search, ShieldBan, Key, Network, LogOut, Globe } from 'lucide-react'
 
 function Layout({ children, onLogout }: { children: React.ReactNode; onLogout: () => void }) {
   const links = [
@@ -13,6 +14,7 @@ function Layout({ children, onLogout }: { children: React.ReactNode; onLogout: (
     { to: '/admin/search', label: 'Search History', icon: Search },
     { to: '/admin/ips', label: 'IP Monitor', icon: ShieldBan },
     { to: '/admin/keys', label: 'API Keys', icon: Key },
+    { to: '/admin/proxies', label: 'Proxies', icon: Network },
   ]
 
   return (
@@ -85,6 +87,7 @@ export default function App() {
           <Route path="/admin/search" element={<SearchHistory />} />
           <Route path="/admin/ips" element={<IPMonitor />} />
           <Route path="/admin/keys" element={<APIKeys />} />
+          <Route path="/admin/proxies" element={<ProxyManager />} />
           <Route path="*" element={<Navigate to="/admin/" replace />} />
         </Routes>
       </Layout>

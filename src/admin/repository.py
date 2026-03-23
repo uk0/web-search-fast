@@ -16,6 +16,8 @@ from src.admin.models import (
     DashboardStats,
     IPBanOut,
     PaginatedResponse,
+    ProxyOut,
+    ProxyStats,
     SearchLogOut,
 )
 
@@ -354,3 +356,133 @@ async def get_analytics(hours: int = 24) -> dict:
     success_rate = round((success / total * 100) if total > 0 else 100, 1)
 
     return {"timeline": timeline, "engines": engines, "success_rate": success_rate}
+
+
+# ---------------------------------------------------------------------------
+# Proxies
+# ---------------------------------------------------------------------------
+
+
+async def add_proxies(urls: list[str], default_scheme: str = "") -> int:
+    """Batch insert proxies, auto-detect scheme, ignore duplicates. Returns count added.
+
+    If a URL has no scheme prefix and default_scheme is provided, it will be
+    prepended automatically (e.g. "user:pass@host:port" → "socks5h://user:pass@host:port").
+    """
+    db = await get_db()
+    added = 0
+    now = datetime.now(timezone.utc).isoformat()
+    valid_schemes = ("socks5h", "socks5", "http", "https")
+    # Normalize default_scheme
+    if default_scheme and default_scheme not in valid_schemes:
+        default_scheme = ""
+    for raw_url in urls:
+        url = raw_url.strip()
+        if not url or url.startswith("#"):
+            continue
+        # Auto-detect scheme from URL prefix
+        if url.startswith("socks5h://"):
+            scheme = "socks5h"
+        elif url.startswith("socks5://"):
+            scheme = "socks5"
+        elif url.startswith("http://"):
+            scheme = "http"
+        elif url.startswith("https://"):
+            scheme = "https"
+        else:
+            # No recognized scheme prefix — use dropdown selection or fallback
+            scheme = default_scheme or "socks5h"
+            url = f"{scheme}://{url}"
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO proxies (url, scheme, created_at) VALUES (?, ?, ?)",
+                (url, scheme, now),
+            )
+            added += 1
+        except Exception:
+            pass
+    await db.commit()
+    # Return actual inserted count (INSERT OR IGNORE may skip duplicates)
+    return added
+
+
+async def list_proxies(active_only: bool = False) -> list[ProxyOut]:
+    db = await get_db()
+    if active_only:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM proxies WHERE is_active = 1 ORDER BY created_at DESC"
+        )
+    else:
+        rows = await db.execute_fetchall("SELECT * FROM proxies ORDER BY created_at DESC")
+    return [
+        ProxyOut(
+            id=r["id"], url=r["url"], scheme=r["scheme"],
+            is_active=bool(r["is_active"]), fail_count=r["fail_count"],
+            last_used_at=r["last_used_at"], created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+async def get_proxy_stats() -> ProxyStats:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as total, "
+        "SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active, "
+        "SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) as inactive, "
+        "SUM(fail_count) as total_failures "
+        "FROM proxies"
+    )
+    r = rows[0]
+    return ProxyStats(
+        total=r["total"] or 0,
+        active=r["active"] or 0,
+        inactive=r["inactive"] or 0,
+        total_failures=r["total_failures"] or 0,
+    )
+
+
+async def delete_proxy(proxy_id: int) -> bool:
+    db = await get_db()
+    cursor = await db.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def toggle_proxy(proxy_id: int, is_active: bool) -> bool:
+    db = await get_db()
+    cursor = await db.execute(
+        "UPDATE proxies SET is_active = ? WHERE id = ?",
+        (1 if is_active else 0, proxy_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_active_proxy_urls() -> list[str]:
+    """Return active proxy URL list for BrowserPool."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT url FROM proxies WHERE is_active = 1 ORDER BY id"
+    )
+    return [r["url"] for r in rows]
+
+
+async def record_proxy_usage(proxy_url: str) -> None:
+    """Update last_used_at for a proxy by URL."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE proxies SET last_used_at = datetime('now') WHERE url = ? AND is_active = 1",
+        (proxy_url,),
+    )
+    await db.commit()
+
+
+async def increment_proxy_failure(proxy_url: str) -> None:
+    """Increment fail_count for a proxy by URL."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE proxies SET fail_count = fail_count + 1 WHERE url = ?",
+        (proxy_url,),
+    )
+    await db.commit()

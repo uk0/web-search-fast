@@ -40,6 +40,13 @@ export const api = {
   unbanIP: (ip: string) => request<{ ok: boolean }>(`/ip-bans/${ip}`, { method: 'DELETE' }),
   getSystem: () => request<SystemInfo>('/system'),
   getAnalytics: (hours = 24) => request<Analytics>(`/analytics?hours=${hours}`),
+  getProxies: () => request<Proxy[]>('/proxies'),
+  importProxies: (urls: string[], scheme?: string) =>
+    request<{ added: number }>('/proxies', { method: 'POST', body: JSON.stringify({ urls, scheme: scheme || '' }) }),
+  deleteProxy: (id: number) => request<{ ok: boolean }>(`/proxies/${id}`, { method: 'DELETE' }),
+  toggleProxy: (id: number, is_active: boolean) =>
+    request<{ ok: boolean }>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify({ is_active }) }),
+  getProxyStats: () => request<ProxyStats>('/proxies/stats'),
 }
 
 export interface Stats {
@@ -125,4 +132,21 @@ export interface Analytics {
   timeline: TimelinePoint[]
   engines: EngineStats[]
   success_rate: number
+}
+
+export interface Proxy {
+  id: number
+  url: string
+  scheme: string
+  is_active: boolean
+  fail_count: number
+  last_used_at: string | null
+  created_at: string
+}
+
+export interface ProxyStats {
+  total: number
+  active: number
+  inactive: number
+  total_failures: number
 }

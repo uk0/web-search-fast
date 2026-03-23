@@ -145,6 +145,71 @@ async def get_analytics(request: Request) -> JSONResponse:
     return JSONResponse(data)
 
 
+# --- Proxies ---
+
+async def list_proxies(request: Request) -> JSONResponse:
+    active_only = request.query_params.get("active_only", "").lower() == "true"
+    proxies = await repository.list_proxies(active_only=active_only)
+    return JSONResponse([p.model_dump() for p in proxies])
+
+
+async def import_proxies(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        data = models.ProxyCreate(**body)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    added = await repository.add_proxies(data.urls, default_scheme=data.scheme)
+    # Hot-reload proxies into BrowserPool
+    await _reload_proxies()
+    return JSONResponse({"added": added}, status_code=201)
+
+
+async def get_proxy_stats(request: Request) -> JSONResponse:
+    stats = await repository.get_proxy_stats()
+    return JSONResponse(stats.model_dump())
+
+
+async def delete_proxy(request: Request) -> JSONResponse:
+    proxy_id = int(request.path_params["id"])
+    ok = await repository.delete_proxy(proxy_id)
+    if not ok:
+        return JSONResponse({"error": "Proxy not found"}, status_code=404)
+    await _reload_proxies()
+    return JSONResponse({"ok": True})
+
+
+async def toggle_proxy(request: Request) -> JSONResponse:
+    proxy_id = int(request.path_params["id"])
+    try:
+        body = await request.json()
+        is_active = body.get("is_active", True)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    ok = await repository.toggle_proxy(proxy_id, is_active)
+    if not ok:
+        return JSONResponse({"error": "Proxy not found"}, status_code=404)
+    await _reload_proxies()
+    return JSONResponse({"ok": True})
+
+
+async def _reload_proxies() -> None:
+    """Reload active proxies from DB into the running BrowserPool."""
+    try:
+        urls = await repository.get_active_proxy_urls()
+        # Get pool instance
+        import sys
+        main_mod = sys.modules.get("__main__")
+        pool = getattr(main_mod, "_pool_instance", None) if main_mod else None
+        if pool is None:
+            from src.mcp_server import _pool_instance as pool
+        if pool and hasattr(pool, "update_proxies"):
+            await pool.update_proxies(urls)
+            logger.info("[admin] hot-reloaded %d proxies into BrowserPool", len(urls))
+    except Exception as exc:
+        logger.warning("[admin] proxy hot-reload failed: %s", exc)
+
+
 # --- Starlette sub-app ---
 
 admin_routes = [
@@ -158,6 +223,11 @@ admin_routes = [
     Route("/admin/api/ip-bans/{ip:path}", delete_ip_ban, methods=["DELETE"]),
     Route("/admin/api/system", get_system, methods=["GET"]),
     Route("/admin/api/analytics", get_analytics, methods=["GET"]),
+    Route("/admin/api/proxies", list_proxies, methods=["GET"]),
+    Route("/admin/api/proxies", import_proxies, methods=["POST"]),
+    Route("/admin/api/proxies/stats", get_proxy_stats, methods=["GET"]),
+    Route("/admin/api/proxies/{id:int}", delete_proxy, methods=["DELETE"]),
+    Route("/admin/api/proxies/{id:int}", toggle_proxy, methods=["PATCH"]),
 ]
 
 

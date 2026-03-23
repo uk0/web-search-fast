@@ -36,6 +36,37 @@ async def _ensure_pool() -> BrowserPool:
     from src.scraper.browser import BrowserPool
 
     config = get_config()
+    # Load proxy list: DB first, then file, merge and deduplicate
+    proxy_list: list[str] | None = None
+    db_proxies: list[str] = []
+    try:
+        from src.admin.repository import get_active_proxy_urls
+        db_proxies = await get_active_proxy_urls()
+        if db_proxies:
+            logger.info("[pool] loaded %d proxies from database", len(db_proxies))
+    except Exception as exc:
+        logger.debug("[pool] no DB proxies available: %s", exc)
+
+    file_proxies: list[str] = []
+    if config.browser.proxy_list_file:
+        try:
+            from src.scraper.proxy import ProxyRotator
+            rotator = ProxyRotator.from_file(config.browser.proxy_list_file)
+            file_proxies = rotator._proxies
+            logger.info("[pool] loaded %d proxies from %s", rotator.count, config.browser.proxy_list_file)
+        except Exception as exc:
+            logger.warning("[pool] failed to load proxy list: %s", exc)
+
+    # Merge and deduplicate (DB takes priority)
+    seen = set()
+    merged: list[str] = []
+    for url in db_proxies + file_proxies:
+        if url not in seen:
+            seen.add(url)
+            merged.append(url)
+    if merged:
+        proxy_list = merged
+        logger.info("[pool] total unique proxies: %d (db=%d, file=%d)", len(merged), len(db_proxies), len(file_proxies))
     _pool_instance = BrowserPool(
         pool_size=config.browser.pool_size,
         max_pool_size=config.browser.max_pool_size,
@@ -49,6 +80,7 @@ async def _ensure_pool() -> BrowserPool:
         fonts=config.browser.fonts,
         block_webgl=config.browser.block_webgl,
         addons=config.browser.addons,
+        proxy_list=proxy_list,
     )
     # Wire up Redis stats push callback
     try:
