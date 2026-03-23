@@ -27,3 +27,6 @@ data/
 src/admin/static/
 admin-ui/node_modules/
 admin-ui/dist/
+proxy_socks5h_list.txt
+*_proxy_list*.txt
+
