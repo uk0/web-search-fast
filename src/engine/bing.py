@@ -42,6 +42,9 @@ class BingSearchEngine(BaseSearchEngine):
     """Bing search engine implementation."""
 
     name: str = "bing"
+    # Bing renders results client-side; wait for the algo list to populate.
+    ready_selector: str = "#b_results li.b_algo, li.b_algo"
+    ready_timeout_ms: int = 6_000
 
     def build_search_url(self, query: str, page: int = 1) -> str:
         """Build Bing search URL using global.bing.com to avoid geo-redirect."""
@@ -53,37 +56,60 @@ class BingSearchEngine(BaseSearchEngine):
         return url
 
     async def parse_results(self, page: Page, max_results: int = 10) -> list[SearchResult]:
-        """Parse search results from Bing SERP."""
+        """Parse search results from Bing SERP — h2>a anchors are the source of truth."""
         raw: list[dict] = await page.evaluate("""() => {
-            let items = Array.from(document.querySelectorAll('li.b_algo'));
-            if (!items.length) {
-                items = Array.from(document.querySelectorAll('#b_results li.b_algo'));
-            }
+            const items = Array.from(
+                document.querySelectorAll('#b_results > li.b_algo, li.b_algo')
+            );
             return items.map(el => {
-                const linkEl = el.querySelector('h2 a');
-                const title = linkEl ? linkEl.innerText.trim() : '';
+                // Title + URL from the primary h2 anchor; some result blocks
+                // (deep links, ads) nest the anchor deeper, so fall back to
+                // any descendant h2 a, or the first http anchor in the block.
+                let linkEl = el.querySelector('h2 a[href^="http"]')
+                    || el.querySelector('h2 a')
+                    || el.querySelector('a[href^="http"]');
+                const title = linkEl ? (linkEl.innerText || linkEl.textContent || '').trim() : '';
                 const url = linkEl ? (linkEl.getAttribute('href') || '') : '';
-                const snippetEl = el.querySelector('div.b_caption p') || el.querySelector('p');
-                const snippet = snippetEl ? snippetEl.innerText.trim() : '';
+                // Snippet: prefer the explicit caption paragraph, then any
+                // descriptive paragraph, then a long descriptive span.
+                let snippet = '';
+                const snippetEl =
+                    el.querySelector('div.b_caption p')
+                    || el.querySelector('p.b_lineclamp4')
+                    || el.querySelector('p.b_lineclamp3')
+                    || el.querySelector('p.b_lineclamp2')
+                    || el.querySelector('p');
+                if (snippetEl) snippet = (snippetEl.innerText || '').trim();
+                if (!snippet) {
+                    const desc = el.querySelector('div.b_caption, div.tpcn');
+                    if (desc) snippet = (desc.innerText || '').trim().substring(0, 300);
+                }
                 return { title, url, snippet };
             });
         }""")
 
         if not raw:
-            logger.warning("No Bing result elements found on page")
+            logger.warning("[bing] no result elements found on page")
             await self._dump_page_diagnostics(page)
             return []
 
+        logger.info("[bing] found %d result elements", len(raw))
+
         results: list[SearchResult] = []
+        seen_urls: set[str] = set()
         for item in raw:
             if len(results) >= max_results:
                 break
-            title = item.get("title", "")
-            url = item.get("url", "")
-            snippet = item.get("snippet", "")
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip()
+            snippet = (item.get("snippet") or "").strip()
             if not title or not url or not url.startswith("http"):
                 continue
             url = _decode_bing_url(url)
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
             results.append(SearchResult(title=title, url=url, snippet=snippet))
 
+        logger.info("[bing] extracted %d valid results from %d elements", len(results), len(raw))
         return results

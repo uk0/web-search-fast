@@ -13,9 +13,19 @@ class TestGoogleEngine:
         url = engine.build_search_url("hello world")
         assert "google.com/search" in url
         assert "hello+world" in url or "hello%20world" in url
+        assert "hl=en" in url
 
     def test_name(self):
         assert GoogleSearchEngine().name == "google"
+
+    def test_ready_selector_configured(self):
+        # Regression: SERP hydration wait depends on this selector. Don't drop it.
+        assert "#rso" in (GoogleSearchEngine.ready_selector or "")
+
+    def test_is_blocked_detects_sorry(self):
+        assert GoogleSearchEngine._is_blocked("https://www.google.com/sorry/index?continue=...")
+        assert GoogleSearchEngine._is_blocked("https://www.google.com/CAPTCHA")
+        assert not GoogleSearchEngine._is_blocked("https://www.google.com/search?q=foo")
 
 
 class TestBingEngine:
@@ -27,6 +37,10 @@ class TestBingEngine:
 
     def test_name(self):
         assert BingSearchEngine().name == "bing"
+
+    def test_ready_selector_configured(self):
+        # Bing renders SERP client-side; the wait selector must target b_algo.
+        assert "b_algo" in (BingSearchEngine.ready_selector or "")
 
 
 class TestDuckDuckGoEngine:

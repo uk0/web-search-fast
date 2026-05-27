@@ -51,6 +51,10 @@ class DuckDuckGoSearchEngine(BaseSearchEngine):
     """DuckDuckGo search engine implementation."""
 
     name: str = "duckduckgo"
+    # html.duckduckgo.com is synchronous, but waiting briefly for .result
+    # guards against future markup drift and slow proxies.
+    ready_selector: str = "div.result, article[data-testid='result']"
+    ready_timeout_ms: int = 4_000
 
     def build_search_url(self, query: str, page: int = 1) -> str:
         """Build DuckDuckGo search URL."""
@@ -62,6 +66,7 @@ class DuckDuckGoSearchEngine(BaseSearchEngine):
         """Override to use HTML-lite version which is more reliable."""
         url = self.build_search_url(query)
         await self._navigate(page, url, retries=1, timeout=10_000)
+        await self._wait_for_results(page)
         return await self.parse_results(page, max_results)
 
     async def parse_results(self, page: Page, max_results: int = 10) -> list[SearchResult]:
