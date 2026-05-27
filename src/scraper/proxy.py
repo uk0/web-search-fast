@@ -7,9 +7,12 @@ to upstream SOCKS5(H) proxies, making them usable with Playwright.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import socket
 import struct
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -355,3 +358,163 @@ class ProxyRotator:
             raise ValueError(f"No proxies found in {path}")
         logger.info("[proxy] loaded %d proxies from %s", len(proxies), path)
         return cls(proxies)
+
+
+# ---------------------------------------------------------------------------
+# Proxy reachability tester
+# ---------------------------------------------------------------------------
+
+
+async def _http_connect_test(
+    proxy_host: str, proxy_port: int,
+    proxy_user: str | None, proxy_pass: str | None,
+    target_host: str, target_port: int, timeout: float,
+) -> None:
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port), timeout=timeout,
+    )
+    try:
+        auth_header = b""
+        if proxy_user:
+            creds = base64.b64encode(
+                f"{proxy_user}:{proxy_pass or ''}".encode()
+            ).decode()
+            auth_header = f"Proxy-Authorization: Basic {creds}\r\n".encode()
+        req = (
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
+        ).encode() + auth_header + b"\r\n"
+        writer.write(req)
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        status_line = line.decode("ascii", errors="replace").strip()
+        if " 200 " not in status_line and not status_line.endswith(" 200"):
+            raise RuntimeError(f"HTTP CONNECT failed: {status_line or 'empty response'}")
+        while True:
+            header = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if header in (b"\r\n", b"\n", b""):
+                break
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def _socks5_test(
+    proxy_host: str, proxy_port: int,
+    proxy_user: str | None, proxy_pass: str | None,
+    target_host: str, target_port: int, timeout: float, remote_dns: bool,
+) -> None:
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port), timeout=timeout,
+    )
+    try:
+        if proxy_user:
+            writer.write(b"\x05\x01\x02")
+        else:
+            writer.write(b"\x05\x01\x00")
+        await writer.drain()
+
+        resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+        if resp[0] != 0x05:
+            raise RuntimeError(f"SOCKS5 version mismatch: {resp[0]}")
+
+        if resp[1] == 0x02 and proxy_user:
+            uname = proxy_user.encode()
+            passwd = (proxy_pass or "").encode()
+            writer.write(
+                b"\x01" + bytes([len(uname)]) + uname
+                + bytes([len(passwd)]) + passwd
+            )
+            await writer.drain()
+            auth_resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+            if auth_resp[1] != 0x00:
+                raise RuntimeError("SOCKS5 auth failed")
+        elif resp[1] == 0xFF:
+            raise RuntimeError("SOCKS5 no acceptable auth method")
+
+        if remote_dns:
+            host_bytes = target_host.encode()
+            writer.write(
+                b"\x05\x01\x00\x03"
+                + bytes([len(host_bytes)]) + host_bytes
+                + struct.pack("!H", target_port)
+            )
+        else:
+            try:
+                addr = socket.inet_aton(target_host)
+                writer.write(b"\x05\x01\x00\x01" + addr + struct.pack("!H", target_port))
+            except OSError:
+                host_bytes = target_host.encode()
+                writer.write(
+                    b"\x05\x01\x00\x03"
+                    + bytes([len(host_bytes)]) + host_bytes
+                    + struct.pack("!H", target_port)
+                )
+        await writer.drain()
+
+        resp = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+        if resp[1] != 0x00:
+            raise RuntimeError(f"SOCKS5 connect failed: status={resp[1]}")
+
+        atyp = resp[3]
+        if atyp == 0x01:
+            await asyncio.wait_for(reader.readexactly(4 + 2), timeout=timeout)
+        elif atyp == 0x03:
+            domain_len = (await asyncio.wait_for(reader.readexactly(1), timeout=timeout))[0]
+            await asyncio.wait_for(reader.readexactly(domain_len + 2), timeout=timeout)
+        elif atyp == 0x04:
+            await asyncio.wait_for(reader.readexactly(16 + 2), timeout=timeout)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def test_proxy(
+    url: str,
+    target_host: str = "www.google.com",
+    target_port: int = 443,
+    timeout: float = 8.0,
+) -> dict:
+    """Probe a proxy by establishing a tunneled TCP connection to target.
+
+    Returns: {"ok": bool, "latency_ms": int, "error": str | None}
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    proxy_host = parsed.hostname or ""
+    if not proxy_host:
+        return {"ok": False, "latency_ms": 0, "error": "missing proxy host"}
+    proxy_port = parsed.port or (1080 if scheme.startswith("socks") else 8080)
+
+    start = time.monotonic()
+    try:
+        if scheme in ("http", "https"):
+            await _http_connect_test(
+                proxy_host, proxy_port, parsed.username, parsed.password,
+                target_host, target_port, timeout,
+            )
+        elif scheme in ("socks5", "socks5h"):
+            await _socks5_test(
+                proxy_host, proxy_port, parsed.username, parsed.password,
+                target_host, target_port, timeout, remote_dns=(scheme == "socks5h"),
+            )
+        else:
+            return {"ok": False, "latency_ms": 0, "error": f"unsupported scheme: {scheme or '?'}"}
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return {"ok": True, "latency_ms": latency_ms, "error": None}
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "latency_ms": int((time.monotonic() - start) * 1000),
+            "error": "timeout",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "latency_ms": int((time.monotonic() - start) * 1000),
+            "error": str(exc) or exc.__class__.__name__,
+        }

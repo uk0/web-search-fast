@@ -108,6 +108,58 @@ class TestAPIKeysEndpoints:
             )
             assert resp.status_code == 400
 
+    def test_reactivate_revoked_key(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.post(
+                "/admin/api/keys",
+                json={"name": "to-reactivate"},
+                headers=auth_headers,
+            )
+            key_id = resp.json()["id"]
+
+            # Revoke first
+            client.delete(f"/admin/api/keys/{key_id}", headers=auth_headers)
+            keys = client.get("/admin/api/keys", headers=auth_headers).json()
+            assert keys[0]["is_active"] is False
+
+            # Reactivate via PATCH
+            resp = client.patch(
+                f"/admin/api/keys/{key_id}",
+                json={"is_active": True},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+            assert resp.json()["is_active"] is True
+
+            keys = client.get("/admin/api/keys", headers=auth_headers).json()
+            assert keys[0]["is_active"] is True
+
+    def test_patch_key_to_inactive(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.post(
+                "/admin/api/keys",
+                json={"name": "toggle-via-patch"},
+                headers=auth_headers,
+            )
+            key_id = resp.json()["id"]
+            resp = client.patch(
+                f"/admin/api/keys/{key_id}",
+                json={"is_active": False},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+            keys = client.get("/admin/api/keys", headers=auth_headers).json()
+            assert keys[0]["is_active"] is False
+
+    def test_patch_nonexistent_key(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.patch(
+                "/admin/api/keys/missing-id",
+                json={"is_active": True},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 404
+
 
 class TestProxiesEndpoints:
     def test_import_and_list_proxies(self, client, auth_headers):
@@ -223,6 +275,31 @@ class TestProxiesEndpoints:
         with _patch_admin_token():
             resp = client.delete("/admin/api/proxies/99999", headers=auth_headers)
             assert resp.status_code == 404
+
+    def test_test_proxy_nonexistent(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.post("/admin/api/proxies/99999/test", headers=auth_headers)
+            assert resp.status_code == 404
+
+    def test_test_proxy_unreachable(self, client, auth_headers):
+        # Point at a non-routable address so the test fails fast without network.
+        with _patch_admin_token():
+            client.post(
+                "/admin/api/proxies",
+                json={"urls": ["socks5h://127.0.0.1:1"]},
+                headers=auth_headers,
+            )
+            proxies = client.get("/admin/api/proxies", headers=auth_headers).json()
+            proxy_id = proxies[0]["id"]
+            resp = client.post(
+                f"/admin/api/proxies/{proxy_id}/test?timeout=2",
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["ok"] is False
+            assert "error" in body
+            assert "latency_ms" in body
 
 
 class TestSystemEndpoint:

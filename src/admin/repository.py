@@ -122,6 +122,16 @@ async def revoke_api_key(key_id: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def set_api_key_active(key_id: str, is_active: bool) -> bool:
+    db = await get_db()
+    cursor = await db.execute(
+        "UPDATE api_keys SET is_active = ? WHERE id = ?",
+        (1 if is_active else 0, key_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Search Logs
 # ---------------------------------------------------------------------------
@@ -439,6 +449,19 @@ async def get_proxy_stats() -> ProxyStats:
         active=r["active"] or 0,
         inactive=r["inactive"] or 0,
         total_failures=r["total_failures"] or 0,
+    )
+
+
+async def get_proxy(proxy_id: int) -> ProxyOut | None:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM proxies WHERE id = ?", (proxy_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    return ProxyOut(
+        id=r["id"], url=r["url"], scheme=r["scheme"],
+        is_active=bool(r["is_active"]), fail_count=r["fail_count"],
+        last_used_at=r["last_used_at"], created_at=r["created_at"],
     )
 
 

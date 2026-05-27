@@ -34,6 +34,11 @@ export const api = {
   createKey: (data: { name: string; call_limit: number }) =>
     request<APIKeyCreated>('/keys', { method: 'POST', body: JSON.stringify(data) }),
   deleteKey: (id: string) => request<{ ok: boolean }>(`/keys/${id}`, { method: 'DELETE' }),
+  setKeyActive: (id: string, is_active: boolean) =>
+    request<{ ok: boolean; is_active: boolean }>(`/keys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ is_active }),
+    }),
   getBans: () => request<IPBan[]>('/ip-bans'),
   banIP: (data: { ip: string; reason: string }) =>
     request<IPBan>('/ip-bans', { method: 'POST', body: JSON.stringify(data) }),
@@ -46,6 +51,8 @@ export const api = {
   deleteProxy: (id: number) => request<{ ok: boolean }>(`/proxies/${id}`, { method: 'DELETE' }),
   toggleProxy: (id: number, is_active: boolean) =>
     request<{ ok: boolean }>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify({ is_active }) }),
+  testProxy: (id: number) =>
+    request<ProxyTestResult>(`/proxies/${id}/test`, { method: 'POST' }),
   getProxyStats: () => request<ProxyStats>('/proxies/stats'),
 }
 
@@ -149,4 +156,10 @@ export interface ProxyStats {
   active: number
   inactive: number
   total_failures: number
+}
+
+export interface ProxyTestResult {
+  ok: boolean
+  latency_ms: number
+  error: string | null
 }

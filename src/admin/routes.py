@@ -70,6 +70,19 @@ async def delete_key(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+async def update_key(request: Request) -> JSONResponse:
+    key_id = request.path_params["key_id"]
+    try:
+        body = await request.json()
+        is_active = bool(body.get("is_active"))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    ok = await repository.set_api_key_active(key_id, is_active)
+    if not ok:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    return JSONResponse({"ok": True, "is_active": is_active})
+
+
 # --- IP Bans ---
 
 async def list_ip_bans(request: Request) -> JSONResponse:
@@ -193,6 +206,24 @@ async def toggle_proxy(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+async def test_proxy(request: Request) -> JSONResponse:
+    from src.scraper.proxy import test_proxy as run_test
+
+    proxy_id = int(request.path_params["id"])
+    proxy = await repository.get_proxy(proxy_id)
+    if not proxy:
+        return JSONResponse({"error": "Proxy not found"}, status_code=404)
+
+    try:
+        timeout = float(request.query_params.get("timeout", "8"))
+    except ValueError:
+        timeout = 8.0
+    timeout = max(1.0, min(timeout, 20.0))
+
+    result = await run_test(proxy.url, timeout=timeout)
+    return JSONResponse(result)
+
+
 async def _reload_proxies() -> None:
     """Reload active proxies from DB into the running BrowserPool."""
     try:
@@ -218,6 +249,7 @@ admin_routes = [
     Route("/admin/api/keys", list_keys, methods=["GET"]),
     Route("/admin/api/keys", create_key, methods=["POST"]),
     Route("/admin/api/keys/{key_id}", delete_key, methods=["DELETE"]),
+    Route("/admin/api/keys/{key_id}", update_key, methods=["PATCH"]),
     Route("/admin/api/ip-bans", list_ip_bans, methods=["GET"]),
     Route("/admin/api/ip-bans", create_ip_ban, methods=["POST"]),
     Route("/admin/api/ip-bans/{ip:path}", delete_ip_ban, methods=["DELETE"]),
@@ -228,6 +260,7 @@ admin_routes = [
     Route("/admin/api/proxies/stats", get_proxy_stats, methods=["GET"]),
     Route("/admin/api/proxies/{id:int}", delete_proxy, methods=["DELETE"]),
     Route("/admin/api/proxies/{id:int}", toggle_proxy, methods=["PATCH"]),
+    Route("/admin/api/proxies/{id:int}/test", test_proxy, methods=["POST"]),
 ]
 
 

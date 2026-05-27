@@ -1,6 +1,49 @@
 import { useEffect, useState, useCallback } from 'react'
-import { api, type Proxy, type ProxyStats } from '@/lib/api'
-import { Network, Trash2, ToggleLeft, ToggleRight, Upload, ChevronDown } from 'lucide-react'
+import { api, type Proxy, type ProxyStats, type ProxyTestResult } from '@/lib/api'
+import { Network, Trash2, ToggleLeft, ToggleRight, Upload, ChevronDown, Zap, Loader2, CheckCircle2, XCircle } from 'lucide-react'
+
+type TestState = { loading: boolean; result?: ProxyTestResult; error?: string; ts?: number }
+
+function latencyColor(ms: number): string {
+  if (ms < 500) return 'var(--accent-green)'
+  if (ms < 1500) return 'var(--accent-orange)'
+  return 'var(--accent-red)'
+}
+
+function TestResultCell({ state }: { state?: TestState }) {
+  if (!state) return <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>—</span>
+  if (state.loading) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-tertiary)' }}>
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Testing...
+      </span>
+    )
+  }
+  if (state.error) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs" style={{ color: 'var(--accent-red)' }} title={state.error}>
+        <XCircle className="h-3.5 w-3.5" />
+        {state.error.length > 24 ? state.error.slice(0, 24) + '…' : state.error}
+      </span>
+    )
+  }
+  const r = state.result!
+  if (r.ok) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium" style={{ color: latencyColor(r.latency_ms) }}>
+        <CheckCircle2 className="h-3.5 w-3.5" />
+        {r.latency_ms} ms
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs" style={{ color: 'var(--accent-red)' }} title={r.error || 'failed'}>
+      <XCircle className="h-3.5 w-3.5" />
+      {(r.error || 'failed').length > 24 ? (r.error || 'failed').slice(0, 24) + '…' : (r.error || 'failed')}
+    </span>
+  )
+}
 
 const SCHEME_OPTIONS = [
   { value: '', label: 'Auto Detect' },
@@ -17,6 +60,8 @@ export default function ProxyManager() {
   const [scheme, setScheme] = useState('')
   const [importing, setImporting] = useState(false)
   const [message, setMessage] = useState('')
+  const [tests, setTests] = useState<Record<number, TestState>>({})
+  const [batchTesting, setBatchTesting] = useState(false)
 
   const load = useCallback(() => {
     api.getProxies().then(setProxies).catch(() => {})
@@ -35,8 +80,8 @@ export default function ProxyManager() {
       setMessage(`Imported ${res.added} proxies`)
       setImportText('')
       load()
-    } catch (e: any) {
-      setMessage(`Error: ${e.message}`)
+    } catch (e) {
+      setMessage(`Error: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
       setImporting(false)
     }
@@ -50,6 +95,35 @@ export default function ProxyManager() {
   const handleDelete = async (id: number) => {
     await api.deleteProxy(id)
     load()
+  }
+
+  const handleTest = async (id: number) => {
+    setTests((prev) => ({ ...prev, [id]: { loading: true } }))
+    try {
+      const result = await api.testProxy(id)
+      setTests((prev) => ({ ...prev, [id]: { loading: false, result, ts: Date.now() } }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setTests((prev) => ({ ...prev, [id]: { loading: false, error: msg || 'request failed', ts: Date.now() } }))
+    }
+  }
+
+  const handleTestAll = async () => {
+    if (batchTesting || proxies.length === 0) return
+    setBatchTesting(true)
+    try {
+      const concurrency = 5
+      const queue = [...proxies]
+      const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+        while (queue.length) {
+          const next = queue.shift()
+          if (next) await handleTest(next.id)
+        }
+      })
+      await Promise.all(workers)
+    } finally {
+      setBatchTesting(false)
+    }
   }
 
   return (
@@ -118,6 +192,20 @@ export default function ProxyManager() {
 
       {/* Proxy Table */}
       <div className="glass overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'rgba(0,0,0,0.06)' }}>
+          <span className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>
+            {proxies.length} {proxies.length === 1 ? 'proxy' : 'proxies'}
+          </span>
+          <button
+            className="glass-btn glass-btn-ghost px-3 py-1.5 text-xs flex items-center gap-1.5"
+            onClick={handleTestAll}
+            disabled={batchTesting || proxies.length === 0}
+            style={{ color: 'var(--accent-blue)' }}
+          >
+            {batchTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+            {batchTesting ? 'Testing...' : 'Test All'}
+          </button>
+        </div>
         <table className="glass-table">
           <thead>
             <tr>
@@ -126,13 +214,14 @@ export default function ProxyManager() {
               <th style={{ width: '80px' }}>Status</th>
               <th style={{ width: '80px' }}>Failures</th>
               <th style={{ width: '150px' }}>Last Used</th>
-              <th style={{ width: '120px' }}>Actions</th>
+              <th style={{ width: '180px' }}>Test Result</th>
+              <th style={{ width: '150px' }}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {proxies.length === 0 && (
               <tr>
-                <td colSpan={6} className="text-center py-8" style={{ color: 'var(--text-tertiary)' }}>
+                <td colSpan={7} className="text-center py-8" style={{ color: 'var(--text-tertiary)' }}>
                   No proxies configured
                 </td>
               </tr>
@@ -167,7 +256,21 @@ export default function ProxyManager() {
                   {p.last_used_at ? new Date(p.last_used_at).toLocaleString() : '—'}
                 </td>
                 <td>
+                  <TestResultCell state={tests[p.id]} />
+                </td>
+                <td>
                   <div className="flex items-center gap-1">
+                    <button
+                      className="glass-btn glass-btn-ghost px-2 py-1 text-xs flex items-center gap-1"
+                      style={{ color: 'var(--accent-blue)' }}
+                      onClick={() => handleTest(p.id)}
+                      disabled={tests[p.id]?.loading}
+                      title="Quick Test"
+                    >
+                      {tests[p.id]?.loading
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <Zap className="h-3.5 w-3.5" />}
+                    </button>
                     <button
                       className="glass-btn glass-btn-ghost px-2 py-1 text-xs flex items-center gap-1"
                       style={{ color: p.is_active ? 'var(--accent-orange)' : 'var(--accent-green)' }}

@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { api, type APIKey, type APIKeyCreated } from '@/lib/api'
-import { Key, Plus, Trash2, Copy, Check } from 'lucide-react'
+import { Key, Plus, Trash2, Copy, Check, RotateCw } from 'lucide-react'
 
 export default function APIKeys() {
   const [keys, setKeys] = useState<APIKey[]>([])
@@ -25,6 +25,11 @@ export default function APIKeys() {
 
   const handleRevoke = async (id: string) => {
     await api.deleteKey(id)
+    load()
+  }
+
+  const handleActivate = async (id: string) => {
+    await api.setKeyActive(id, true)
     load()
   }
 
@@ -138,7 +143,7 @@ export default function APIKeys() {
                   {new Date(k.created_at).toLocaleString()}
                 </td>
                 <td>
-                  {k.is_active && (
+                  {k.is_active ? (
                     <button
                       className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
                       style={{ color: 'var(--accent-red)' }}
@@ -146,6 +151,15 @@ export default function APIKeys() {
                     >
                       <Trash2 className="h-3 w-3" />
                       Revoke
+                    </button>
+                  ) : (
+                    <button
+                      className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
+                      style={{ color: 'var(--accent-green)' }}
+                      onClick={() => handleActivate(k.id)}
+                    >
+                      <RotateCw className="h-3 w-3" />
+                      Activate
                     </button>
                   )}
                 </td>
