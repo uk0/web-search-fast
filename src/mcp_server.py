@@ -81,6 +81,7 @@ async def _ensure_pool() -> BrowserPool:
         block_webgl=config.browser.block_webgl,
         addons=config.browser.addons,
         proxy_list=proxy_list,
+        block_resources=config.browser.block_resources,
     )
     # Wire up Redis stats push callback
     try:

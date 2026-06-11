@@ -39,6 +39,10 @@ _SCALE_UP_THRESHOLD = 0.8   # scale up when 80% of semaphore slots are in use
 _SCALE_DOWN_THRESHOLD = 0.3  # scale down when <30% utilization for cooldown period
 _SCALE_COOLDOWN_SECS = 10    # minimum seconds between scaling events
 
+# Resource types aborted when block_resources is on — never needed for text
+# extraction. Scripts/stylesheets are kept (Google/Bing hydrate via JS).
+_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+
 
 class BrowserPool:
     def __init__(
@@ -56,6 +60,7 @@ class BrowserPool:
         block_webgl: bool = False,
         addons: list[str] | None = None,
         proxy_list: list[str] | None = None,
+        block_resources: bool = True,
     ):
         self._pool_size = pool_size
         self._max_pool_size = max(pool_size, max_pool_size)
@@ -70,6 +75,7 @@ class BrowserPool:
         self._fonts = fonts or []
         self._block_webgl = block_webgl
         self._addons = addons or []
+        self._block_resources = block_resources
         # --- proxy rotation ---
         self._proxy_rotator = None
         if proxy_list:
@@ -277,6 +283,33 @@ class BrowserPool:
         except Exception:
             pass
 
+    async def _install_resource_blocker(self, page: Page) -> None:
+        """Abort heavy subresource requests (image/media/font) to speed loads.
+
+        Scripts and stylesheets pass through — Google/Bing build their SERP
+        client-side, so killing JS would break extraction. Best-effort: any
+        routing error falls back to letting the request continue.
+        """
+        if not self._block_resources:
+            return
+
+        async def _route(route) -> None:
+            try:
+                if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        try:
+            await page.route("**/*", _route)
+        except Exception as exc:
+            logger.debug("[pool] resource blocker install failed: %s", exc)
+
     async def _maybe_scale_up(self) -> None:
         """Increase semaphore capacity if utilization is high."""
         if self._pool_size >= self._max_pool_size:
@@ -393,6 +426,8 @@ class BrowserPool:
                     logger.error("[pool] req#%d — new_page() failed: %s, restarting browser", req_id, exc)
                     await self.restart()
                     page = await self._browser.new_page()  # type: ignore[union-attr]
+
+            await self._install_resource_blocker(page)
 
             open_ms = (time.monotonic() - t0) * 1000
             logger.info("[pool] req#%d — tab opened in %.0fms (semaphore slots: %d/%d)",

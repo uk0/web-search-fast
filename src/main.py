@@ -15,11 +15,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     config = get_config()
     pool = BrowserPool(
         pool_size=config.browser.pool_size,
+        max_pool_size=config.browser.max_pool_size,
         headless=config.browser.headless,
         geoip=config.browser.geoip,
         humanize=config.browser.humanize,
         locale=config.browser.locale,
         block_images=config.browser.block_images,
+        block_resources=config.browser.block_resources,
     )
     await pool.start()
     set_browser_pool(pool)

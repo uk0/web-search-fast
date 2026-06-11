@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from urllib.parse import quote_plus
 
 from playwright.async_api import Page
@@ -11,6 +12,11 @@ from src.engine.base import BaseSearchEngine
 
 logger = logging.getLogger(__name__)
 
+# Homepage warm-up costs a full extra navigation (~1-2s) per search. Probes
+# showed it gives no reliable CAPTCHA benefit, so it's off by default; set
+# GOOGLE_WARMUP=1 to re-enable (e.g. for EU-routed proxies hitting consent walls).
+_WARMUP_HOMEPAGE = os.environ.get("GOOGLE_WARMUP", "").lower() in ("1", "true", "yes")
+
 
 class GoogleSearchEngine(BaseSearchEngine):
     """Google search engine implementation."""
@@ -19,6 +25,7 @@ class GoogleSearchEngine(BaseSearchEngine):
     # Google's SERP is JS-hydrated; wait for the result container to populate.
     ready_selector: str = "#rso h3, #search h3"
     ready_timeout_ms: int = 6_000
+    warmup_homepage: bool = _WARMUP_HOMEPAGE
 
     def build_search_url(self, query: str, page: int = 1) -> str:
         encoded_query = quote_plus(query)
@@ -30,13 +37,17 @@ class GoogleSearchEngine(BaseSearchEngine):
         return url
 
     async def search(self, page: Page, query: str, max_results: int = 10) -> list[SearchResult]:
-        """Override to warm up Google session and bail out fast on CAPTCHA blocks."""
-        # Visit Google homepage first to establish cookies (fast, short timeout)
-        try:
-            await self._navigate(page, "https://www.google.com/", retries=0, timeout=5_000)
-            await self._handle_consent(page)
-        except Exception:
-            logger.debug("Google homepage warm-up failed, proceeding anyway")
+        """Search Google, bailing out fast on CAPTCHA blocks.
+
+        Homepage warm-up is skipped by default (saves ~1-2s/search); enable
+        with GOOGLE_WARMUP=1. Consent is still handled on the SERP itself.
+        """
+        if self.warmup_homepage:
+            try:
+                await self._navigate(page, "https://www.google.com/", retries=0, timeout=5_000)
+                await self._handle_consent(page)
+            except Exception:
+                logger.debug("Google homepage warm-up failed, proceeding anyway")
 
         # Now perform the actual search
         url = self.build_search_url(query, 1)

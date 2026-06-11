@@ -27,6 +27,32 @@ class TestGoogleEngine:
         assert GoogleSearchEngine._is_blocked("https://www.google.com/CAPTCHA")
         assert not GoogleSearchEngine._is_blocked("https://www.google.com/search?q=foo")
 
+    def test_warmup_off_by_default(self):
+        # Homepage warm-up is an opt-in cost; default must be skip-for-speed.
+        assert GoogleSearchEngine.warmup_homepage is False
+
+    @pytest.mark.asyncio
+    async def test_search_skips_homepage_when_warmup_off(self):
+        # With warmup off, search() must NOT navigate to the homepage first —
+        # only the search URL should be requested.
+        engine = GoogleSearchEngine()
+        engine.warmup_homepage = False
+        page = AsyncMock()
+        page.url = "https://www.google.com/search?q=x"
+        goto_urls = []
+
+        async def _goto(url, **kw):
+            goto_urls.append(url)
+            return MagicMock(status=200)
+
+        page.goto = AsyncMock(side_effect=_goto)
+        page.wait_for_selector = AsyncMock()
+        page.query_selector = AsyncMock(return_value=None)
+        page.evaluate = AsyncMock(return_value=[{"title": "T", "url": "https://e.com", "snippet": "s"}])
+
+        await engine.search(page, "x", max_results=5)
+        assert not any(u == "https://www.google.com/" for u in goto_urls)
+
 
 class TestBingEngine:
     def test_build_url(self):

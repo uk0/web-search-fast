@@ -26,6 +26,10 @@ class BrowserConfig(BaseModel):
     humanize: float = Field(default=0.5, ge=0, description="Humanized cursor movement duration (0 to disable)")
     locale: str = Field(default="en-US", description="Browser locale")
     block_images: bool = Field(default=True, description="Block image loading for faster page loads")
+    block_resources: bool = Field(
+        default=True,
+        description="Abort image/media/font requests via routing for faster page loads",
+    )
     # Advanced Camoufox features
     proxy: str = Field(default="", description="Proxy URL (e.g. socks5://127.0.0.1:1080)")
     os_target: str = Field(default="", description="Target OS fingerprint: windows, macos, linux")
@@ -56,6 +60,12 @@ def get_config() -> AppConfig:
         browser_kwargs["pool_size"] = int(pool_size)
     if max_pool_size := os.environ.get("BROWSER_MAX_POOL_SIZE"):
         browser_kwargs["max_pool_size"] = int(max_pool_size)
+    if (humanize := os.environ.get("BROWSER_HUMANIZE")) is not None and humanize != "":
+        browser_kwargs["humanize"] = float(humanize)
+    if (block_res := os.environ.get("BROWSER_BLOCK_RESOURCES", "").lower()) in ("0", "false", "no"):
+        browser_kwargs["block_resources"] = False
+    elif block_res in ("1", "true", "yes"):
+        browser_kwargs["block_resources"] = True
     if proxy := os.environ.get("BROWSER_PROXY"):
         browser_kwargs["proxy"] = proxy
     if os_target := os.environ.get("BROWSER_OS"):

@@ -45,6 +45,63 @@ class TestExtractMainContentMarkdown:
         assert "main content paragraph" in md
 
 
+# A realistic page with no semantic <main>: a noisy nav/sidebar plus a dense
+# article div. The density scorer must pick the article, not the link soup.
+NOISY_HTML = """
+<html><body>
+<div id="sidebar">
+  <a href="https://x.com/1">Cat 1</a><a href="https://x.com/2">Cat 2</a>
+  <a href="https://x.com/3">Cat 3</a><a href="https://x.com/4">Cat 4</a>
+</div>
+<div class="post-body">
+  <h1>Understanding Async IO</h1>
+  <p>Asynchronous programming lets a single thread juggle many tasks by
+  yielding control while waiting on I/O. This paragraph is intentionally long
+  so that the density score clearly beats the link-heavy sidebar block above.</p>
+  <p>The event loop schedules coroutines and resumes them when their awaited
+  operations complete, which keeps throughput high without extra threads.</p>
+</div>
+<div id="comments"><a href="https://x.com/c">A comment link</a></div>
+</body></html>
+"""
+
+
+class TestAutoContentDetection:
+    def test_picks_dense_block_over_link_soup(self):
+        text = extract_main_content(NOISY_HTML)
+        assert "Understanding Async IO" in text
+        assert "event loop schedules coroutines" in text
+        # Sidebar category links must not dominate the extracted content
+        assert "Cat 1" not in text
+
+    def test_semantic_main_preferred(self):
+        html = """
+        <html><body>
+        <div class="ad">buy now buy now buy now</div>
+        <main><p>The canonical article body lives in a semantic main element
+        and contains more than two hundred characters of real prose so that
+        the semantic-container shortcut accepts it immediately without having
+        to fall through to the density scoring path at all here.</p></main>
+        </body></html>
+        """
+        text = extract_main_content(html)
+        assert "canonical article body" in text
+        assert "buy now" not in text
+
+    def test_empty_main_falls_through_to_density(self):
+        # Empty <main> shell must NOT win — scorer should pick the real div.
+        html = """
+        <html><body>
+        <main></main>
+        <div class="story"><p>Real content that is long enough to be detected
+        by the density scorer because it comfortably exceeds the minimum text
+        threshold required for a block to score above zero in our heuristic.</p></div>
+        </body></html>
+        """
+        text = extract_main_content(html)
+        assert "Real content that is long enough" in text
+
+
 class TestExtractLinks:
     def test_extracts_http_links(self):
         links = extract_links(SAMPLE_HTML)
