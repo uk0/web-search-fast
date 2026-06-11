@@ -229,3 +229,111 @@ class TestBrowserPoolHealth:
             pool = BrowserPool()
             await pool.start()
             assert await pool.is_healthy() is False
+
+
+class TestRecordFailureClassification:
+    def test_proxy_failure_does_not_bump_consecutive(self):
+        pool = BrowserPool()
+        pool.record_failure(browser_related=False)
+        pool.record_failure(browser_related=False)
+        pool.record_failure(browser_related=False)
+        assert pool._total_failures == 3
+        assert pool._consecutive_failures == 0
+        assert pool.needs_restart is False
+
+    def test_browser_failure_bumps_consecutive(self):
+        pool = BrowserPool()
+        pool.record_failure(browser_related=True)
+        pool.record_failure()  # default is browser_related
+        assert pool._consecutive_failures == 2
+        assert pool._total_failures == 2
+
+
+class TestRestartCooldown:
+    @pytest.mark.asyncio
+    async def test_rapid_second_restart_skipped(self, mock_camoufox):
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool()
+            await pool.start()
+            await pool.restart()
+            count_after_first = pool._restart_count
+            await pool.restart()  # within cooldown — should be skipped
+            assert pool._restart_count == count_after_first
+
+    @pytest.mark.asyncio
+    async def test_force_restart_bypasses_cooldown(self, mock_camoufox):
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool()
+            await pool.start()
+            await pool.restart()
+            count_after_first = pool._restart_count
+            await pool.restart(force=True)
+            assert pool._restart_count == count_after_first + 1
+
+
+class TestProxyRotatorCircuitBreaker:
+    def _mk(self, n=3):
+        from src.scraper.proxy import ProxyRotator
+        return ProxyRotator([f"http://proxy{i}:8080" for i in range(n)])
+
+    def test_benched_proxy_skipped(self):
+        rot = self._mk(3)
+        bad = "http://proxy0:8080"
+        rot.mark_failed(bad)
+        rot.mark_failed(bad)  # trips breaker at 2 consecutive
+        served = {rot.next()["_original_url"] for _ in range(6)}
+        assert bad not in served
+
+    def test_single_failure_not_benched(self):
+        rot = self._mk(3)
+        rot.mark_failed("http://proxy0:8080")
+        served = {rot.next()["_original_url"] for _ in range(6)}
+        assert "http://proxy0:8080" in served
+
+    def test_mark_ok_resets_breaker(self):
+        rot = self._mk(3)
+        bad = "http://proxy1:8080"
+        rot.mark_failed(bad)
+        rot.mark_ok(bad)
+        rot.mark_failed(bad)  # 1 consecutive again — not benched
+        served = {rot.next()["_original_url"] for _ in range(6)}
+        assert bad in served
+
+    def test_all_benched_still_serves(self):
+        rot = self._mk(2)
+        for url in ("http://proxy0:8080", "http://proxy1:8080"):
+            rot.mark_failed(url)
+            rot.mark_failed(url)
+        cfg = rot.next()  # half-open probe — must not raise
+        assert cfg["_original_url"].startswith("http://proxy")
+
+    def test_cooldown_expiry_readmits(self):
+        import time as _t
+        rot = self._mk(2)
+        bad = "http://proxy0:8080"
+        rot.mark_failed(bad)
+        rot.mark_failed(bad)
+        # Force-expire the cooldown
+        rot._cooldown_until[bad] = _t.monotonic() - 1
+        served = {rot.next()["_original_url"] for _ in range(4)}
+        assert bad in served
+
+
+class TestProxyErrorClassification:
+    def test_ns_proxy_errors(self):
+        from src.scraper.proxy import is_proxy_error
+        assert is_proxy_error("goto: NS_ERROR_PROXY_BAD_GATEWAY")
+        assert is_proxy_error("goto: NS_ERROR_PROXY_FORBIDDEN")
+        assert is_proxy_error("NS_ERROR_UNKNOWN_PROXY_HOST")
+        assert is_proxy_error(RuntimeError("SOCKS5 auth failed"))
+
+    def test_timeout_only_proxy_error_when_rotating(self):
+        from src.scraper.proxy import is_proxy_error
+        msg = "goto: Timeout 10000ms exceeded."
+        assert is_proxy_error(msg, rotating=True)
+        assert not is_proxy_error(msg, rotating=False)
+
+    def test_normal_errors_not_classified(self):
+        from src.scraper.proxy import is_proxy_error
+        assert not is_proxy_error("ValueError: bad parse")
+        assert not is_proxy_error("HTTP 404 Not Found")

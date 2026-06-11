@@ -20,10 +20,20 @@ async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
 
     Uses 'domcontentloaded' for speed — most content is available without
     waiting for all resources to load.
+
+    Site errors are swallowed (return "") — a dead target site is normal.
+    Proxy-caused errors are re-raised when proxy rotation is active so the
+    BrowserPool feedback hook can bench the proxy and callers can retry.
     """
+    from src.scraper.proxy import is_proxy_error
+
+    rotating = bool(getattr(page, "_wsm_rotating", False))
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=min(timeout, 12) * 1000)
     except Exception as exc:
+        if rotating and is_proxy_error(exc, rotating=True):
+            logger.warning("fetch_page_content proxy error for %s: %s", url, exc)
+            raise
         logger.warning("fetch_page_content failed for %s: %s", url, exc)
         return ""
     try:
@@ -34,28 +44,43 @@ async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
 
 
 async def enrich_with_content(pool: BrowserPool, result: SearchResult, timeout: int = 30) -> SearchResult:
-    """Depth 2: fetch the result URL and extract main content."""
-    async with pool.acquire() as page:
-        html = await fetch_page_content(page, result.url, timeout)
-        if html:
-            result.content = extract_main_content(html)
+    """Depth 2: fetch the result URL and extract main content.
+
+    Proxy errors are absorbed here (the acquire hook already benched the
+    proxy) — the result is kept, just without enriched content.
+    """
+    try:
+        async with pool.acquire() as page:
+            html = await fetch_page_content(page, result.url, timeout)
+    except Exception as exc:
+        logger.warning("enrich_with_content skipped for %s: %s", result.url[:100], str(exc)[:100])
+        return result
+    if html:
+        result.content = extract_main_content(html)
     return result
 
 
 async def enrich_with_sub_links(pool: BrowserPool, result: SearchResult, timeout: int = 30, max_sub: int = 5) -> SearchResult:
     """Depth 3: fetch content + extract and follow sub-links."""
-    async with pool.acquire() as page:
-        html = await fetch_page_content(page, result.url, timeout)
-        if not html:
-            return result
-        result.content = extract_main_content(html)
-        links = extract_links(html, result.url)[:max_sub]
+    try:
+        async with pool.acquire() as page:
+            html = await fetch_page_content(page, result.url, timeout)
+    except Exception as exc:
+        logger.warning("enrich_with_sub_links skipped for %s: %s", result.url[:100], str(exc)[:100])
+        return result
+    if not html:
+        return result
+    result.content = extract_main_content(html)
+    links = extract_links(html, result.url)[:max_sub]
 
     async def fetch_sub(link: dict[str, str]) -> SubLink:
-        async with pool.acquire() as p:
-            sub_html = await fetch_page_content(p, link["url"], timeout)
-            content = extract_main_content(sub_html) if sub_html else ""
-            return SubLink(url=link["url"], title=link.get("title", ""), content=content[:5000])
+        try:
+            async with pool.acquire() as p:
+                sub_html = await fetch_page_content(p, link["url"], timeout)
+        except Exception:
+            sub_html = ""
+        content = extract_main_content(sub_html) if sub_html else ""
+        return SubLink(url=link["url"], title=link.get("title", ""), content=content[:5000])
 
     if links:
         sub_results = await asyncio.gather(*[fetch_sub(lnk) for lnk in links], return_exceptions=True)

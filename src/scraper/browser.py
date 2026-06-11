@@ -15,6 +15,23 @@ logger = logging.getLogger(__name__)
 _MAX_CONSECUTIVE_FAILURES = 3
 # Health check: navigate about:blank within this timeout (ms)
 _HEALTH_CHECK_TIMEOUT_MS = 5000
+# Min seconds between browser restarts — absorbs restart storms when several
+# concurrent requests all hit failures at once
+_RESTART_COOLDOWN_SECS = 30.0
+# Context-creation attempts (each with a different proxy) before giving up
+_CONTEXT_PROXY_ATTEMPTS = 3
+# Error substrings meaning the browser process itself is gone
+_BROWSER_DEAD_MARKERS = (
+    "Connection closed",
+    "has been closed",
+    "Browser closed",
+    "Target closed",
+)
+
+
+def _is_browser_dead_error(exc: Exception) -> bool:
+    s = str(exc)
+    return any(marker in s for marker in _BROWSER_DEAD_MARKERS)
 # Auto-scaling defaults
 _DEFAULT_POOL_SIZE = 30
 _DEFAULT_MAX_POOL_SIZE = 90
@@ -68,6 +85,7 @@ class BrowserPool:
         self._total_failures = 0
         self._restart_count = 0
         self._restart_lock = asyncio.Lock()
+        self._last_restart_time = 0.0
         self._active_tabs = 0
         # --- auto-scaling ---
         self._last_scale_time = 0.0
@@ -142,15 +160,26 @@ class BrowserPool:
         logger.info("[pool] stopped (requests=%d, failures=%d, restarts=%d)",
                      self._total_requests, self._total_failures, self._restart_count)
 
-    async def restart(self) -> None:
-        """Stop and re-create the browser. Serialized via lock to avoid races."""
+    async def restart(self, *, force: bool = False) -> None:
+        """Stop and re-create the browser. Serialized via lock to avoid races.
+
+        Concurrent failures tend to pile up restart requests; once one
+        coroutine has restarted, the rest skip (cooldown) instead of
+        bouncing the browser again and killing fresh in-flight tabs.
+        """
         async with self._restart_lock:
+            since_last = time.monotonic() - self._last_restart_time
+            if not force and self._started and since_last < _RESTART_COOLDOWN_SECS:
+                logger.info("[pool] restart skipped — browser restarted %.0fs ago", since_last)
+                self._consecutive_failures = 0
+                return
             self._restart_count += 1
             logger.warning("[pool] restarting browser (restart #%d, consecutive_failures=%d)",
                            self._restart_count, self._consecutive_failures)
             await self.stop()
             await self.start()
             self._consecutive_failures = 0
+            self._last_restart_time = time.monotonic()
             logger.info("[pool] browser restarted successfully")
 
     async def is_healthy(self) -> bool:
@@ -170,12 +199,18 @@ class BrowserPool:
         """Record a successful request — resets consecutive failure counter."""
         self._consecutive_failures = 0
 
-    def record_failure(self) -> None:
-        """Record a failed request — increments counters."""
-        self._consecutive_failures += 1
+    def record_failure(self, *, browser_related: bool = True) -> None:
+        """Record a failed request.
+
+        Proxy-caused failures (``browser_related=False``) count toward the
+        total but NOT toward the consecutive counter that triggers browser
+        restarts — a dead proxy is not a dead browser.
+        """
         self._total_failures += 1
-        logger.warning("[pool] failure recorded (consecutive=%d, total=%d)",
-                       self._consecutive_failures, self._total_failures)
+        if browser_related:
+            self._consecutive_failures += 1
+        logger.warning("[pool] failure recorded (consecutive=%d, total=%d, browser_related=%s)",
+                       self._consecutive_failures, self._total_failures, browser_related)
 
     @property
     def needs_restart(self) -> bool:
@@ -298,43 +333,58 @@ class BrowserPool:
             raise RuntimeError(f"Browser pool exhausted (pool_size={self._pool_size})")
 
         context = None
+        original_url = ""
         try:
             t0 = time.monotonic()
 
             if self._proxy_rotator:
-                # Per-request proxy via browser context
-                proxy_config = self._proxy_rotator.next()
-                original_url = proxy_config.pop("_original_url", "")
-                proxy_server = proxy_config.get("server", "")
-                proxy_short = f"{proxy_server[:30]}...{proxy_server[-10:]}" if len(proxy_server) > 45 else proxy_server
-                logger.info("[pool] req#%d — using proxy: %s", req_id, proxy_short)
-                # Record usage in DB (fire-and-forget)
-                if original_url:
-                    asyncio.create_task(self._record_proxy_usage(original_url))
-                try:
-                    context = await self._browser.new_context(  # type: ignore[union-attr]
-                        proxy=proxy_config,
-                    )
-                    page = await context.new_page()
-                except Exception as exc:
-                    logger.error("[pool] req#%d — context/page failed: %s, restarting", req_id, exc)
-                    if original_url:
-                        asyncio.create_task(self._record_proxy_failure(original_url))
-                    if context:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-                        context = None
-                    await self.restart()
+                # Per-request proxy via browser context. A context failure is
+                # almost always a bad proxy or a dead browser — try the next
+                # proxy instead of bouncing the whole browser (which would
+                # kill every in-flight tab); restart only when the browser
+                # process is actually gone.
+                last_exc: Exception | None = None
+                page = None
+                for ctx_attempt in range(1, _CONTEXT_PROXY_ATTEMPTS + 1):
                     proxy_config = self._proxy_rotator.next()
                     original_url = proxy_config.pop("_original_url", "")
+                    proxy_server = proxy_config.get("server", "")
+                    if len(proxy_server) > 45:
+                        proxy_server = f"{proxy_server[:30]}...{proxy_server[-10:]}"
+                    logger.info("[pool] req#%d — using proxy: %s (attempt %d/%d)",
+                                req_id, proxy_server, ctx_attempt, _CONTEXT_PROXY_ATTEMPTS)
                     if original_url:
                         asyncio.create_task(self._record_proxy_usage(original_url))
-                    context = await self._browser.new_context(  # type: ignore[union-attr]
-                        proxy=proxy_config,
+                    try:
+                        context = await self._browser.new_context(  # type: ignore[union-attr]
+                            proxy=proxy_config,
+                        )
+                        page = await context.new_page()
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if context:
+                            try:
+                                await context.close()
+                            except Exception:
+                                pass
+                            context = None
+                        if original_url:
+                            self._proxy_rotator.mark_failed(original_url)
+                            asyncio.create_task(self._record_proxy_failure(original_url))
+                        if _is_browser_dead_error(exc):
+                            logger.error("[pool] req#%d — browser appears dead (%s), restarting",
+                                         req_id, str(exc)[:100])
+                            await self.restart()
+                        else:
+                            logger.warning("[pool] req#%d — context failed via proxy (%s), trying next",
+                                           req_id, str(exc)[:100])
+                if page is None:
+                    raise RuntimeError(
+                        f"context creation failed after {_CONTEXT_PROXY_ATTEMPTS} proxies: {last_exc}"
                     )
-                    page = await context.new_page()
+                # Tag so engines can fail fast instead of retrying a dead proxy
+                page._wsm_rotating = True  # type: ignore[attr-defined]
             else:
                 # Default: direct page from browser (no context isolation)
                 try:
@@ -351,6 +401,18 @@ class BrowserPool:
             await self._push_stats()
             try:
                 yield page
+            except Exception as exc:
+                # Feedback loop: navigation failures caused by the proxy bench
+                # it in the rotator and bump fail_count in the DB.
+                if self._proxy_rotator and original_url:
+                    from src.scraper.proxy import is_proxy_error
+                    if is_proxy_error(exc, rotating=True):
+                        self._proxy_rotator.mark_failed(original_url)
+                        asyncio.create_task(self._record_proxy_failure(original_url))
+                raise
+            else:
+                if self._proxy_rotator and original_url:
+                    self._proxy_rotator.mark_ok(original_url)
             finally:
                 self._active_tabs -= 1
                 await self._push_stats()

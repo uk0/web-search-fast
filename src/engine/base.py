@@ -102,7 +102,16 @@ class BaseSearchEngine(abc.ABC):
             logger.warning("[%s] DIAGNOSTIC dump failed: %s", self.name, exc)
 
     async def _navigate(self, page: Page, url: str, retries: int = 1, timeout: int = 10_000) -> None:
-        """Navigate with retry logic for transient failures."""
+        """Navigate with retry logic for transient failures.
+
+        With proxy rotation active (page tagged by BrowserPool), proxy-caused
+        failures are raised immediately: retrying on the same dead proxy just
+        burns another full timeout. The search layer retries with a fresh
+        page/proxy instead.
+        """
+        from src.scraper.proxy import is_proxy_error
+
+        rotating = bool(getattr(page, "_wsm_rotating", False))
         last_err: Exception | None = None
         for attempt in range(retries + 1):
             t0 = time.monotonic()
@@ -124,6 +133,10 @@ class BaseSearchEngine(abc.ABC):
                     self.name, attempt + 1, retries + 1, elapsed,
                     type(exc).__name__, str(exc)[:200],
                 )
+                if rotating and is_proxy_error(exc, rotating=True):
+                    logger.warning("[%s] proxy-suspect failure — failing fast (no same-proxy retry)",
+                                   self.name)
+                    raise
                 if attempt < retries:
                     try:
                         await page.goto("about:blank", timeout=3000)

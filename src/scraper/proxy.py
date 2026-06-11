@@ -21,6 +21,39 @@ logger = logging.getLogger(__name__)
 # Port range for local proxy bridges
 _LOCAL_PORT_START = 19100
 
+# Circuit breaker: consecutive failures before a proxy is benched, and
+# how long it stays benched (doubles per extra failure, capped).
+_FAILS_TO_TRIP = 2
+_BASE_COOLDOWN_SECS = 90.0
+_MAX_COOLDOWN_SECS = 600.0
+
+# Error substrings that indicate the proxy (not the target site) is broken.
+_PROXY_ERROR_MARKERS = (
+    "NS_ERROR_PROXY",                # BAD_GATEWAY / FORBIDDEN / CONNECTION_REFUSED / AUTH
+    "NS_ERROR_UNKNOWN_PROXY_HOST",
+    "NS_ERROR_CONNECTION_REFUSED",
+    "NS_ERROR_NET_RESET",
+    "NS_ERROR_NET_TIMEOUT",
+    "NS_ERROR_UNKNOWN_HOST",         # remote-DNS failure through socks5h
+    "SOCKS",
+    "502 Bad Gateway",
+)
+
+
+def is_proxy_error(error: str | Exception, *, rotating: bool = False) -> bool:
+    """Classify an error as proxy-caused.
+
+    With ``rotating=True``, navigation timeouts are also treated as
+    proxy-suspect: SERP domains (google/bing/ddg) are never slow enough to
+    blow a 10s nav timeout through a healthy proxy.
+    """
+    s = str(error)
+    if any(marker in s for marker in _PROXY_ERROR_MARKERS):
+        return True
+    if rotating and "Timeout" in s and "exceeded" in s:
+        return True
+    return False
+
 
 def _parse_socks_url(url: str) -> dict:
     """Parse a socks5(h)://user:pass@host:port URL."""
@@ -243,6 +276,9 @@ class ProxyRotator:
         self._index = 0
         self._lock = threading.Lock()
         self._failures: dict[str, int] = {}
+        # Circuit breaker state: consecutive failures + bench expiry per proxy
+        self._consec_fails: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
         self._bridges: list[_Socks5Bridge] = []
         self._bridge_urls: list[str] = []
         self._bridges_started = False
@@ -285,7 +321,11 @@ class ProxyRotator:
         self._bridges_started = False
 
     def next(self) -> dict:
-        """Return the next proxy as a Playwright proxy config dict.
+        """Return the next healthy proxy as a Playwright proxy config dict.
+
+        Proxies benched by the circuit breaker (repeated failures) are
+        skipped until their cooldown expires. If every proxy is benched,
+        the one whose cooldown expires soonest is returned (half-open probe).
 
         Returns {"server": url, "_original_url": ...} for simple proxies, or
         {"server": url, "username": ..., "password": ..., "_original_url": ...} for auth proxies.
@@ -293,35 +333,39 @@ class ProxyRotator:
         The "_original_url" key holds the raw proxy URL for DB tracking.
         """
         with self._lock:
-            idx = self._index % len(self._proxies)
-            self._index += 1
-            original_url = self._proxies[idx]
+            n = len(self._proxies)
+            now = time.monotonic()
+            chosen_idx: int | None = None
+            for _ in range(n):
+                idx = self._index % n
+                self._index += 1
+                url = self._proxies[idx]
+                if self._cooldown_until.get(url, 0.0) <= now:
+                    chosen_idx = idx
+                    break
+            if chosen_idx is None:
+                # Every proxy is benched — probe the one closest to recovery
+                chosen_idx = min(
+                    range(n),
+                    key=lambda i: self._cooldown_until.get(self._proxies[i], 0.0),
+                )
+                logger.warning(
+                    "[proxy] all %d proxies benched — half-open probe of %s...",
+                    n, self._proxies[chosen_idx][:30],
+                )
+            return self._build_config(chosen_idx)
 
-            if self._bridges_started and self._bridge_urls:
-                bridge_url = self._bridge_urls[idx]
-                parsed = urlparse(original_url)
-                # SOCKS5 bridges strip auth — just return server URL
-                # HTTP(S) proxies with auth — extract credentials for Playwright
-                if parsed.scheme in ("http", "https") and parsed.username:
-                    # Strip credentials from URL for the server field
-                    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-                    return {
-                        "server": server,
-                        "username": parsed.username,
-                        "password": parsed.password or "",
-                        "_original_url": original_url,
-                    }
-                return {"server": bridge_url, "_original_url": original_url}
+    def _build_config(self, idx: int) -> dict:
+        """Build the Playwright proxy config for the proxy at ``idx``."""
+        original_url = self._proxies[idx]
 
-            # Fallback: direct URL with socks5h→socks5 conversion
-            proxy = original_url
-            parsed = urlparse(proxy)
-            if proxy.startswith("socks5h://"):
-                proxy = "socks5://" + proxy[len("socks5h://"):]
-                parsed = urlparse(proxy)
-
-            # Extract auth for HTTP(S) proxies
+        if self._bridges_started and self._bridge_urls:
+            bridge_url = self._bridge_urls[idx]
+            parsed = urlparse(original_url)
+            # SOCKS5 bridges strip auth — just return server URL
+            # HTTP(S) proxies with auth — extract credentials for Playwright
             if parsed.scheme in ("http", "https") and parsed.username:
+                # Strip credentials from URL for the server field
                 server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
                 return {
                     "server": server,
@@ -329,16 +373,50 @@ class ProxyRotator:
                     "password": parsed.password or "",
                     "_original_url": original_url,
                 }
-            return {"server": proxy, "_original_url": original_url}
+            return {"server": bridge_url, "_original_url": original_url}
+
+        # Fallback: direct URL with socks5h→socks5 conversion
+        proxy = original_url
+        parsed = urlparse(proxy)
+        if proxy.startswith("socks5h://"):
+            proxy = "socks5://" + proxy[len("socks5h://"):]
+            parsed = urlparse(proxy)
+
+        # Extract auth for HTTP(S) proxies
+        if parsed.scheme in ("http", "https") and parsed.username:
+            server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+            return {
+                "server": server,
+                "username": parsed.username,
+                "password": parsed.password or "",
+                "_original_url": original_url,
+            }
+        return {"server": proxy, "_original_url": original_url}
 
     def mark_failed(self, proxy: str) -> None:
-        """Record a failure for a proxy."""
+        """Record a failure; bench the proxy once it trips the breaker."""
         with self._lock:
             self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            consec = self._consec_fails.get(proxy, 0) + 1
+            self._consec_fails[proxy] = consec
+            benched = ""
+            if consec >= _FAILS_TO_TRIP:
+                cooldown = min(
+                    _BASE_COOLDOWN_SECS * (2 ** (consec - _FAILS_TO_TRIP)),
+                    _MAX_COOLDOWN_SECS,
+                )
+                self._cooldown_until[proxy] = time.monotonic() + cooldown
+                benched = f", benched for {cooldown:.0f}s"
             logger.warning(
-                "[proxy] marked failed: %s...%s (total=%d)",
-                proxy[:30], proxy[-10:], self._failures[proxy],
+                "[proxy] marked failed: %s...%s (consec=%d, total=%d%s)",
+                proxy[:30], proxy[-10:], consec, self._failures[proxy], benched,
             )
+
+    def mark_ok(self, proxy: str) -> None:
+        """Record a success — clears breaker state for the proxy."""
+        with self._lock:
+            self._consec_fails.pop(proxy, None)
+            self._cooldown_until.pop(proxy, None)
 
     @property
     def count(self) -> int:
