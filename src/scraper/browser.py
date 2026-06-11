@@ -61,6 +61,7 @@ class BrowserPool:
         addons: list[str] | None = None,
         proxy_list: list[str] | None = None,
         block_resources: bool = True,
+        geo_fingerprint: bool = True,
     ):
         self._pool_size = pool_size
         self._max_pool_size = max(pool_size, max_pool_size)
@@ -76,6 +77,8 @@ class BrowserPool:
         self._block_webgl = block_webgl
         self._addons = addons or []
         self._block_resources = block_resources
+        # Per-context IP-derived geo fingerprint (only meaningful w/ rotation)
+        self._geo_fingerprint = geo_fingerprint
         # --- proxy rotation ---
         self._proxy_rotator = None
         if proxy_list:
@@ -242,6 +245,9 @@ class BrowserPool:
 
     async def update_proxies(self, proxy_urls: list[str]) -> None:
         """Hot-reload proxy list without restarting the browser."""
+        # Drop stale geo fingerprints — bridge ports/exit IPs may change
+        from src.scraper import geo as geomod
+        geomod.clear_cache()
         # Stop old bridges
         if self._proxy_rotator:
             await self._proxy_rotator.stop_bridges()
@@ -282,6 +288,23 @@ class BrowserPool:
             await increment_proxy_failure(proxy_url)
         except Exception:
             pass
+
+    def _apply_geo_fingerprint(self, ctx_kwargs: dict, proxy_config: dict, original_url: str) -> None:
+        """Add IP-consistent locale/timezone/geolocation to context kwargs.
+
+        Uses the cached fingerprint for this proxy when available; otherwise
+        kicks off a background resolve (no latency on this request) so the
+        next request through the same proxy gets a matching fingerprint.
+        """
+        if not (self._geo_fingerprint and original_url):
+            return
+        from src.scraper import geo as geomod
+
+        fp = geomod.peek(original_url)
+        if fp:
+            ctx_kwargs.update(geomod.context_geo_kwargs(fp))
+        elif geomod.should_resolve(original_url):
+            asyncio.create_task(geomod.resolve(original_url, dict(proxy_config)))
 
     async def _install_resource_blocker(self, page: Page) -> None:
         """Abort heavy subresource requests (image/media/font) to speed loads.
@@ -388,10 +411,10 @@ class BrowserPool:
                                 req_id, proxy_server, ctx_attempt, _CONTEXT_PROXY_ATTEMPTS)
                     if original_url:
                         asyncio.create_task(self._record_proxy_usage(original_url))
+                    ctx_kwargs: dict = {"proxy": proxy_config}
+                    self._apply_geo_fingerprint(ctx_kwargs, proxy_config, original_url)
                     try:
-                        context = await self._browser.new_context(  # type: ignore[union-attr]
-                            proxy=proxy_config,
-                        )
+                        context = await self._browser.new_context(**ctx_kwargs)  # type: ignore[union-attr]
                         page = await context.new_page()
                         break
                     except Exception as exc:

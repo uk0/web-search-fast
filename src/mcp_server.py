@@ -82,6 +82,7 @@ async def _ensure_pool() -> BrowserPool:
         addons=config.browser.addons,
         proxy_list=proxy_list,
         block_resources=config.browser.block_resources,
+        geo_fingerprint=config.browser.geo_fingerprint,
     )
     # Wire up Redis stats push callback
     try:

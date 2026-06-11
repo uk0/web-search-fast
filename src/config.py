@@ -30,6 +30,10 @@ class BrowserConfig(BaseModel):
         default=True,
         description="Abort image/media/font requests via routing for faster page loads",
     )
+    geo_fingerprint: bool = Field(
+        default=True,
+        description="Derive per-proxy locale/timezone/geolocation from the proxy exit IP",
+    )
     # Advanced Camoufox features
     proxy: str = Field(default="", description="Proxy URL (e.g. socks5://127.0.0.1:1080)")
     os_target: str = Field(default="", description="Target OS fingerprint: windows, macos, linux")
@@ -66,6 +70,10 @@ def get_config() -> AppConfig:
         browser_kwargs["block_resources"] = False
     elif block_res in ("1", "true", "yes"):
         browser_kwargs["block_resources"] = True
+    if (geo_fp := os.environ.get("BROWSER_GEO_FINGERPRINT", "").lower()) in ("0", "false", "no"):
+        browser_kwargs["geo_fingerprint"] = False
+    elif geo_fp in ("1", "true", "yes"):
+        browser_kwargs["geo_fingerprint"] = True
     if proxy := os.environ.get("BROWSER_PROXY"):
         browser_kwargs["proxy"] = proxy
     if os_target := os.environ.get("BROWSER_OS"):
