@@ -13,6 +13,11 @@ def mock_browser():
     browser = AsyncMock()
     page = AsyncMock()
     page.close = AsyncMock()
+    # Non-proxy path now uses explicit new_context().new_page() for isolation
+    context = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.close = AsyncMock()
+    browser.new_context = AsyncMock(return_value=context)
     browser.new_page = AsyncMock(return_value=page)
     return browser, page
 
@@ -29,7 +34,8 @@ def mock_camoufox(mock_browser):
 class TestBrowserPoolInit:
     def test_defaults(self):
         pool = BrowserPool()
-        assert pool._pool_size == 30
+        assert pool._pool_size == 18
+        assert pool._max_pool_size == 36
         assert pool._headless is True
         assert pool._started is False
 
@@ -70,7 +76,8 @@ class TestBrowserPoolAcquire:
 
             async with pool.acquire() as p:
                 assert p is page
-                browser.new_page.assert_awaited_once()
+                # Explicit per-request context for tab-level isolation
+                browser.new_context.assert_awaited_once()
 
             # page.close called after context exit
             page.close.assert_awaited_once()
@@ -193,10 +200,13 @@ class TestBrowserPoolHealth:
             assert pool._consecutive_failures == 0
 
     @pytest.mark.asyncio
-    async def test_acquire_restarts_on_new_page_failure(self, mock_camoufox, mock_browser):
+    async def test_acquire_restarts_on_new_context_failure(self, mock_camoufox, mock_browser):
         browser, page = mock_browser
-        # First new_page fails, second succeeds (after restart)
-        browser.new_page = AsyncMock(side_effect=[Exception("browser crashed"), page])
+        # First new_context fails, second succeeds (after restart)
+        good_ctx = AsyncMock()
+        good_ctx.new_page = AsyncMock(return_value=page)
+        good_ctx.close = AsyncMock()
+        browser.new_context = AsyncMock(side_effect=[Exception("browser crashed"), good_ctx])
         page.goto = AsyncMock()
         with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
             pool = BrowserPool(pool_size=2)

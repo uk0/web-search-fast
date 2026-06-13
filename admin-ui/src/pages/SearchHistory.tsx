@@ -2,6 +2,65 @@ import { Fragment, useEffect, useState, useCallback } from 'react'
 import { api, type SearchLog } from '@/lib/api'
 import { Search, ChevronDown, ChevronRight, Clock, Cpu, User, FileText, Filter } from 'lucide-react'
 
+const PAGE_SIZE = 100  // matches server-side retention cap
+
+function pct(n: number, d: number): number {
+  return d > 0 ? Math.round((n / d) * 1000) / 10 : 100
+}
+
+function SummaryStrip({ logs }: { logs: SearchLog[] }) {
+  if (logs.length === 0) return null
+  const withCode = logs.filter((l) => l.status_code !== null)
+  const ok = withCode.filter((l) => (l.status_code ?? 0) < 400).length
+  const successRate = pct(ok + (logs.length - withCode.length), logs.length)
+  const lats = logs.map((l) => l.elapsed_ms).filter((m): m is number => m !== null).sort((a, b) => a - b)
+  const avg = lats.length ? Math.round(lats.reduce((s, m) => s + m, 0) / lats.length) : 0
+  const p95 = lats.length ? lats[Math.min(lats.length - 1, Math.floor(lats.length * 0.95))] : 0
+
+  const byKey = (sel: (l: SearchLog) => string | null) => {
+    const m = new Map<string, number>()
+    for (const l of logs) {
+      const k = sel(l)
+      if (k) m.set(k, (m.get(k) || 0) + 1)
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1])
+  }
+  const engines = byKey((l) => l.engine)
+  const tools = byKey((l) => l.tool_name)
+
+  const cards = [
+    { label: 'Requests', value: String(logs.length), color: 'var(--text-primary)' },
+    { label: 'Success', value: `${successRate}%`, color: successRate >= 90 ? 'var(--accent-green)' : successRate >= 70 ? 'var(--accent-orange)' : 'var(--accent-red)' },
+    { label: 'Avg', value: `${avg.toLocaleString()}ms`, color: avg < 5000 ? 'var(--accent-green)' : 'var(--accent-orange)' },
+    { label: 'P95', value: `${p95.toLocaleString()}ms`, color: p95 < 10000 ? 'var(--accent-green)' : 'var(--accent-orange)' },
+  ]
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {cards.map((c) => (
+        <div key={c.label} className="glass p-3 text-center">
+          <div className="text-xl font-bold" style={{ color: c.color }}>{c.value}</div>
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-tertiary)' }}>{c.label}</div>
+        </div>
+      ))}
+      {(engines.length > 0 || tools.length > 0) && (
+        <div className="glass p-3 col-span-2 md:col-span-4 flex flex-wrap items-center gap-2">
+          {engines.map(([name, n]) => (
+            <span key={name} className="glass-badge" style={{ background: 'rgba(175,82,222,0.08)', color: 'var(--accent-purple)' }}>
+              {name} · {n}
+            </span>
+          ))}
+          {tools.map(([name, n]) => (
+            <span key={name} className="glass-badge" style={{ background: 'rgba(0,122,255,0.08)', color: 'var(--accent-blue)' }}>
+              {name} · {n}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function StatusBadge({ code }: { code: number | null }) {
   if (code === null) return <span style={{ color: 'var(--text-tertiary)' }}>—</span>
   const color = code < 400 ? 'var(--accent-green)' : code < 500 ? 'var(--accent-orange)' : 'var(--accent-red)'
@@ -57,8 +116,10 @@ function DetailPanel({ log }: { log: SearchLog }) {
             <div className="space-y-3">
               {log.request_body && (
                 <>
-                  <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>Request Body</p>
-                  <pre className="text-xs font-mono p-3 rounded-lg overflow-auto max-h-32"
+                  <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+                    Request Body <span style={{ color: 'var(--text-tertiary)' }}>· {log.request_body.length.toLocaleString()} B</span>
+                  </p>
+                  <pre className="text-xs font-mono p-3 rounded-lg overflow-auto max-h-40"
                        style={{ background: 'rgba(0,0,0,0.03)', color: 'var(--text-secondary)' }}>
                     {tryFormatJson(log.request_body)}
                   </pre>
@@ -66,10 +127,12 @@ function DetailPanel({ log }: { log: SearchLog }) {
               )}
               {log.response_body && (
                 <>
-                  <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>Response Preview</p>
-                  <pre className="text-xs font-mono p-3 rounded-lg overflow-auto max-h-32"
+                  <p className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+                    Response Preview <span style={{ color: 'var(--text-tertiary)' }}>· {log.response_body.length.toLocaleString()} B</span>
+                  </p>
+                  <pre className="text-xs font-mono p-3 rounded-lg overflow-auto max-h-60"
                        style={{ background: 'rgba(0,0,0,0.03)', color: 'var(--text-secondary)' }}>
-                    {truncate(tryFormatJson(log.response_body), 100)}
+                    {truncate(tryFormatJson(log.response_body), 1200)}
                   </pre>
                 </>
               )}
@@ -103,7 +166,7 @@ export default function SearchHistory() {
   const [expandedId, setExpandedId] = useState<number | null>(null)
 
   const load = useCallback(() => {
-    const params: Record<string, string> = { page: String(page), page_size: '20' }
+    const params: Record<string, string> = { page: String(page), page_size: String(PAGE_SIZE) }
     if (ipFilter) params.ip = ipFilter
     if (queryFilter) params.query = queryFilter
     api.getSearchLogs(params).then((r) => { setLogs(r.items); setTotal(r.total) }).catch(() => {})
@@ -111,7 +174,7 @@ export default function SearchHistory() {
 
   useEffect(() => { load() }, [load])
 
-  const totalPages = Math.ceil(total / 20) || 1
+  const totalPages = Math.ceil(total / PAGE_SIZE) || 1
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -119,9 +182,12 @@ export default function SearchHistory() {
         <Search className="h-6 w-6" style={{ color: 'var(--accent-blue)' }} />
         <h1 className="text-2xl font-semibold" style={{ color: 'var(--text-primary)' }}>Search History</h1>
         <span className="glass-badge ml-auto" style={{ background: 'rgba(0,122,255,0.08)', color: 'var(--accent-blue)' }}>
-          {total.toLocaleString()} total
+          {total.toLocaleString()} retained
         </span>
       </div>
+
+      {/* Summary metrics */}
+      <SummaryStrip logs={logs} />
 
       {/* Filters */}
       <div className="glass p-4">
@@ -215,7 +281,7 @@ export default function SearchHistory() {
           </button>
           <button
             className="glass-btn glass-btn-ghost px-4 py-1.5 text-sm disabled:opacity-40"
-            disabled={logs.length < 20}
+            disabled={logs.length < PAGE_SIZE}
             onClick={() => setPage(page + 1)}
           >
             Next

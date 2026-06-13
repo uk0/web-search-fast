@@ -18,8 +18,8 @@ class OutputFormat(str, Enum):
 
 
 class BrowserConfig(BaseModel):
-    pool_size: int = Field(default=30, ge=1, le=100, description="Initial browser concurrency slots")
-    max_pool_size: int = Field(default=90, ge=1, le=100, description="Max auto-scaled concurrency slots")
+    pool_size: int = Field(default=18, ge=1, le=100, description="Initial browser concurrency slots (half of max)")
+    max_pool_size: int = Field(default=36, ge=1, le=100, description="Max auto-scaled concurrency slots")
     headless: bool = Field(default=True)
     timeout: int = Field(default=30, ge=5, le=120, description="Page load timeout in seconds")
     geoip: bool = Field(default=True, description="Enable GeoIP spoofing based on real IP")

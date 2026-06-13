@@ -32,9 +32,9 @@ _BROWSER_DEAD_MARKERS = (
 def _is_browser_dead_error(exc: Exception) -> bool:
     s = str(exc)
     return any(marker in s for marker in _BROWSER_DEAD_MARKERS)
-# Auto-scaling defaults
-_DEFAULT_POOL_SIZE = 30
-_DEFAULT_MAX_POOL_SIZE = 90
+# Auto-scaling defaults — initial pool is half of the ceiling
+_DEFAULT_POOL_SIZE = 18
+_DEFAULT_MAX_POOL_SIZE = 36
 _SCALE_UP_THRESHOLD = 0.8   # scale up when 80% of semaphore slots are in use
 _SCALE_DOWN_THRESHOLD = 0.3  # scale down when <30% utilization for cooldown period
 _SCALE_COOLDOWN_SECS = 10    # minimum seconds between scaling events
@@ -442,13 +442,23 @@ class BrowserPool:
                 # Tag so engines can fail fast instead of retrying a dead proxy
                 page._wsm_rotating = True  # type: ignore[attr-defined]
             else:
-                # Default: direct page from browser (no context isolation)
+                # Default: explicit per-request context for guaranteed tab-level
+                # isolation (own cookie jar / storage / cache — no cross-search
+                # leakage). Closed in finally alongside the page.
                 try:
-                    page = await self._browser.new_page()  # type: ignore[union-attr]
+                    context = await self._browser.new_context()  # type: ignore[union-attr]
+                    page = await context.new_page()
                 except Exception as exc:
-                    logger.error("[pool] req#%d — new_page() failed: %s, restarting browser", req_id, exc)
+                    logger.error("[pool] req#%d — new_context() failed: %s, restarting browser", req_id, exc)
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                        context = None
                     await self.restart()
-                    page = await self._browser.new_page()  # type: ignore[union-attr]
+                    context = await self._browser.new_context()  # type: ignore[union-attr]
+                    page = await context.new_page()
 
             await self._install_resource_blocker(page)
 

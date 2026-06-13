@@ -302,6 +302,29 @@ class TestProxiesEndpoints:
             assert "latency_ms" in body
 
 
+class TestSearchLogRetention:
+    @pytest.mark.asyncio
+    async def test_prunes_to_max(self, monkeypatch):
+        from src.admin import repository
+        monkeypatch.setattr(repository, "MAX_SEARCH_LOGS", 5)
+        for i in range(8):
+            await repository.log_search(query=f"q{i}", ip_address="1.1.1.1")
+        result = await repository.list_search_logs(page=1, page_size=50)
+        assert result.total == 5  # only newest 5 retained
+        queries = {it.query for it in result.items}
+        assert "q7" in queries  # newest kept
+        assert "q0" not in queries  # oldest pruned
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_pruning(self, monkeypatch):
+        from src.admin import repository
+        monkeypatch.setattr(repository, "MAX_SEARCH_LOGS", 0)
+        for i in range(6):
+            await repository.log_search(query=f"keep{i}", ip_address="2.2.2.2")
+        result = await repository.list_search_logs(page=1, page_size=50)
+        assert result.total == 6  # unbounded
+
+
 class TestSystemEndpoint:
     def test_get_system(self, client, auth_headers):
         with _patch_admin_token():

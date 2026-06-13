@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,13 @@ logger = logging.getLogger(__name__)
 
 # Optional Redis — graceful fallback to SQLite
 _redis = None
+
+# Keep only the newest N search logs to bound storage; older rows are pruned
+# on each insert. 0 disables pruning (unbounded).
+try:
+    MAX_SEARCH_LOGS = int(os.environ.get("MAX_SEARCH_LOGS", "100"))
+except ValueError:
+    MAX_SEARCH_LOGS = 100
 
 
 async def init_redis(url: str | None) -> None:
@@ -158,6 +166,16 @@ async def log_search(
         (api_key_id, query, engine, ip_address, user_agent, status_code, elapsed_ms,
          request_body, response_body, tool_name, now),
     )
+    # Retention: drop everything older than the newest MAX_SEARCH_LOGS rows.
+    # OFFSET picks the cutoff id; when fewer rows exist the subquery is NULL
+    # and nothing is deleted. Ids are autoincrement (monotonic), so id-order
+    # equals insert-order.
+    if MAX_SEARCH_LOGS > 0:
+        await db.execute(
+            "DELETE FROM search_logs WHERE id <= "
+            "(SELECT id FROM search_logs ORDER BY id DESC LIMIT 1 OFFSET ?)",
+            (MAX_SEARCH_LOGS,),
+        )
     await db.commit()
 
 
