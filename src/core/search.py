@@ -43,7 +43,16 @@ FALLBACK_ORDER: dict[SearchEngine, list[SearchEngine]] = {
 async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
     """Execute a search with engine fallback and multi-depth crawling."""
     if not pool._started:
-        raise SearchError("Browser pool not initialized")
+        # A prior browser launch/restart may have failed, leaving the pool
+        # down. Try to bring it back before giving up so one bad launch
+        # doesn't brick every subsequent request.
+        logger.warning("[search] pool not started — attempting recovery restart")
+        try:
+            await pool.restart()
+        except Exception as exc:
+            raise SearchError(f"Browser pool not initialized: {exc}") from exc
+        if not pool._started:
+            raise SearchError("Browser pool not initialized")
 
     start = time.monotonic()
     total_timeout = req.timeout or 25

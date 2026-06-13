@@ -416,6 +416,9 @@ def main() -> None:
                 return _JSONResponse(format_json(response))
             except SearchError as e:
                 return _JSONResponse({"error": str(e)}, status_code=503)
+            except Exception as e:
+                logger.error("[/search] %s: %s", type(e).__name__, e)
+                return _JSONResponse({"error": f"search failed: {e}"}, status_code=502)
 
         async def _search_post(request):
             """POST /search {query, engine, depth, format, max_results, timeout}"""
@@ -446,6 +449,9 @@ def main() -> None:
                 return _JSONResponse(format_json(response))
             except SearchError as e:
                 return _JSONResponse({"error": str(e)}, status_code=503)
+            except Exception as e:
+                logger.error("[/search] %s: %s", type(e).__name__, e)
+                return _JSONResponse({"error": f"search failed: {e}"}, status_code=502)
 
         app.routes.insert(0, _Route("/search", _search_get, methods=["GET"]))
         app.routes.insert(0, _Route("/search", _search_post, methods=["POST"]))

@@ -95,6 +95,9 @@ class BrowserPool:
         self._restart_count = 0
         self._restart_lock = asyncio.Lock()
         self._last_restart_time = 0.0
+        # Bumped on every successful start — lets concurrent dead-browser
+        # detectors dedupe: only one restart runs per dead generation.
+        self._browser_generation = 0
         self._active_tabs = 0
         # --- auto-scaling ---
         self._last_scale_time = 0.0
@@ -144,6 +147,7 @@ class BrowserPool:
         self._camoufox = AsyncCamoufox(**self._build_camoufox_kwargs())
         self._browser = await self._camoufox.__aenter__()
         self._started = True
+        self._browser_generation += 1
         elapsed = (time.monotonic() - t0) * 1000
         logger.info(
             "[pool] started in %.0fms: pool_size=%d, geoip=%s, humanize=%s, "
@@ -169,27 +173,39 @@ class BrowserPool:
         logger.info("[pool] stopped (requests=%d, failures=%d, restarts=%d)",
                      self._total_requests, self._total_failures, self._restart_count)
 
-    async def restart(self, *, force: bool = False) -> None:
+    async def restart(self, *, expected_generation: int | None = None) -> None:
         """Stop and re-create the browser. Serialized via lock to avoid races.
 
-        Concurrent failures tend to pile up restart requests; once one
-        coroutine has restarted, the rest skip (cooldown) instead of
-        bouncing the browser again and killing fresh in-flight tabs.
+        Two callers:
+        - Dead-browser recovery passes ``expected_generation`` (the generation
+          it saw fail). If the browser was already restarted since then
+          (generation advanced), this is a no-op — concurrent detectors of the
+          same crash collapse into a single restart. Otherwise it ALWAYS
+          restarts: a dead browser must be replaced regardless of cooldown.
+        - Preventive restart (consecutive failures / timeout) passes nothing
+          and is throttled by a cooldown to avoid restart storms.
         """
         async with self._restart_lock:
-            since_last = time.monotonic() - self._last_restart_time
-            if not force and self._started and since_last < _RESTART_COOLDOWN_SECS:
-                logger.info("[pool] restart skipped — browser restarted %.0fs ago", since_last)
-                self._consecutive_failures = 0
-                return
+            if expected_generation is not None:
+                if expected_generation != self._browser_generation:
+                    logger.info("[pool] restart skipped — already at generation %d (saw %d)",
+                                self._browser_generation, expected_generation)
+                    self._consecutive_failures = 0
+                    return
+            elif self._started:
+                since_last = time.monotonic() - self._last_restart_time
+                if since_last < _RESTART_COOLDOWN_SECS:
+                    logger.info("[pool] preventive restart skipped — restarted %.0fs ago", since_last)
+                    self._consecutive_failures = 0
+                    return
             self._restart_count += 1
-            logger.warning("[pool] restarting browser (restart #%d, consecutive_failures=%d)",
-                           self._restart_count, self._consecutive_failures)
+            logger.warning("[pool] restarting browser (restart #%d, generation=%d, consecutive_failures=%d)",
+                           self._restart_count, self._browser_generation, self._consecutive_failures)
             await self.stop()
             await self.start()
             self._consecutive_failures = 0
             self._last_restart_time = time.monotonic()
-            logger.info("[pool] browser restarted successfully")
+            logger.info("[pool] browser restarted successfully (generation=%d)", self._browser_generation)
 
     async def is_healthy(self) -> bool:
         """Quick health check — open a blank page and close it."""
@@ -413,6 +429,7 @@ class BrowserPool:
                         asyncio.create_task(self._record_proxy_usage(original_url))
                     ctx_kwargs: dict = {"proxy": proxy_config}
                     self._apply_geo_fingerprint(ctx_kwargs, proxy_config, original_url)
+                    gen = self._browser_generation
                     try:
                         context = await self._browser.new_context(**ctx_kwargs)  # type: ignore[union-attr]
                         page = await context.new_page()
@@ -425,14 +442,15 @@ class BrowserPool:
                             except Exception:
                                 pass
                             context = None
-                        if original_url:
-                            self._proxy_rotator.mark_failed(original_url)
-                            asyncio.create_task(self._record_proxy_failure(original_url))
                         if _is_browser_dead_error(exc):
                             logger.error("[pool] req#%d — browser appears dead (%s), restarting",
                                          req_id, str(exc)[:100])
-                            await self.restart()
+                            await self.restart(expected_generation=gen)
                         else:
+                            # Genuine proxy failure — bench it and try the next
+                            if original_url:
+                                self._proxy_rotator.mark_failed(original_url)
+                                asyncio.create_task(self._record_proxy_failure(original_url))
                             logger.warning("[pool] req#%d — context failed via proxy (%s), trying next",
                                            req_id, str(exc)[:100])
                 if page is None:
@@ -445,6 +463,7 @@ class BrowserPool:
                 # Default: explicit per-request context for guaranteed tab-level
                 # isolation (own cookie jar / storage / cache — no cross-search
                 # leakage). Closed in finally alongside the page.
+                gen = self._browser_generation
                 try:
                     context = await self._browser.new_context()  # type: ignore[union-attr]
                     page = await context.new_page()
@@ -456,7 +475,7 @@ class BrowserPool:
                         except Exception:
                             pass
                         context = None
-                    await self.restart()
+                    await self.restart(expected_generation=gen)
                     context = await self._browser.new_context()  # type: ignore[union-attr]
                     page = await context.new_page()
 

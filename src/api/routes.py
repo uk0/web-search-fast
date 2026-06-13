@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
@@ -9,6 +11,8 @@ from src.core.search import SearchError, do_search
 from src.formatter.json_fmt import format_json
 from src.formatter.markdown_fmt import format_markdown
 from src.scraper.browser import BrowserPool
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -27,6 +31,12 @@ async def _do_search(req: SearchRequest) -> SearchResponse:
         return await do_search(_pool, req)
     except SearchError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        # Catch everything at the route boundary: a raw exception propagating
+        # into Starlette's BaseHTTPMiddleware stack triggers an anyio
+        # exception-group unwind bug. Convert to a clean 502 instead.
+        logger.error("[api] search failed: %s: %s", type(e).__name__, e)
+        raise HTTPException(status_code=502, detail=f"search failed: {e}")
 
 
 @router.post("/search", response_model=SearchResponse)

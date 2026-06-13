@@ -261,24 +261,41 @@ class TestRecordFailureClassification:
 
 class TestRestartCooldown:
     @pytest.mark.asyncio
-    async def test_rapid_second_restart_skipped(self, mock_camoufox):
+    async def test_preventive_rapid_second_restart_skipped(self, mock_camoufox):
+        # Preventive restarts (no expected_generation) are throttled by cooldown
         with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
             pool = BrowserPool()
             await pool.start()
             await pool.restart()
             count_after_first = pool._restart_count
-            await pool.restart()  # within cooldown — should be skipped
+            await pool.restart()  # within cooldown — skipped
             assert pool._restart_count == count_after_first
 
     @pytest.mark.asyncio
-    async def test_force_restart_bypasses_cooldown(self, mock_camoufox):
+    async def test_dead_browser_restart_ignores_cooldown(self, mock_camoufox):
+        # Dead-browser restart (expected_generation == current) must ALWAYS
+        # restart, even immediately after a preventive one — recovery first.
         with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
             pool = BrowserPool()
             await pool.start()
-            await pool.restart()
+            await pool.restart()  # preventive, sets cooldown
             count_after_first = pool._restart_count
-            await pool.restart(force=True)
+            gen = pool._browser_generation
+            await pool.restart(expected_generation=gen)
             assert pool._restart_count == count_after_first + 1
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_restart_deduped(self, mock_camoufox):
+        # Two coroutines see the same crash; the second (stale generation)
+        # must NOT restart again — one restart per dead generation.
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool()
+            await pool.start()
+            stale_gen = pool._browser_generation
+            await pool.restart(expected_generation=stale_gen)  # first detector restarts
+            count = pool._restart_count
+            await pool.restart(expected_generation=stale_gen)  # second detector: deduped
+            assert pool._restart_count == count
 
 
 class TestProxyRotatorCircuitBreaker:
