@@ -302,6 +302,30 @@ class TestProxiesEndpoints:
             assert "latency_ms" in body
 
 
+class TestSearchLogKeyName:
+    @pytest.mark.asyncio
+    async def test_log_includes_key_name(self):
+        from src.admin import repository
+        key = await repository.create_api_key(name="reporting-bot")
+        await repository.log_search(query="q1", ip_address="1.1.1.1", api_key_id=key.id)
+        result = await repository.list_search_logs(page=1, page_size=10)
+        assert result.items[0].api_key_name == "reporting-bot"
+
+    @pytest.mark.asyncio
+    async def test_unknown_key_name_is_none(self):
+        from src.admin import repository
+        await repository.log_search(query="q2", ip_address="2.2.2.2", api_key_id="ghost-id")
+        result = await repository.list_search_logs(page=1, page_size=10)
+        assert result.items[0].api_key_name is None  # key not in api_keys table
+
+    @pytest.mark.asyncio
+    async def test_no_key_name_when_anonymous(self):
+        from src.admin import repository
+        await repository.log_search(query="q3", ip_address="3.3.3.3")
+        result = await repository.list_search_logs(page=1, page_size=10)
+        assert result.items[0].api_key_name is None
+
+
 class TestSearchLogRetention:
     @pytest.mark.asyncio
     async def test_prunes_to_max(self, monkeypatch):

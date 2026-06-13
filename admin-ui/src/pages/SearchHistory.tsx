@@ -77,7 +77,7 @@ function LatencyBadge({ ms }: { ms: number | null }) {
 function DetailPanel({ log }: { log: SearchLog }) {
   return (
     <tr>
-      <td colSpan={7} className="!p-0">
+      <td colSpan={9} className="!p-0">
         <div className="animate-slide-down px-6 py-4 mx-4 mb-3 rounded-xl"
              style={{ background: 'rgba(0,0,0,0.02)' }}>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -103,7 +103,9 @@ function DetailPanel({ log }: { log: SearchLog }) {
                 <>
                   <div className="flex items-center gap-2 mt-3">
                     <FileText className="h-3.5 w-3.5" style={{ color: 'var(--text-tertiary)' }} />
-                    <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>API Key ID</span>
+                    <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+                      API Key{log.api_key_name ? ` · ${log.api_key_name}` : ' (revoked)'}
+                    </span>
                   </div>
                   <p className="text-xs font-mono pl-5.5" style={{ color: 'var(--text-secondary)' }}>
                     {log.api_key_id}
@@ -217,6 +219,7 @@ export default function SearchHistory() {
               <th>Query</th>
               <th>Engine</th>
               <th>Tool</th>
+              <th>Key</th>
               <th>IP</th>
               <th>Status</th>
               <th>Latency</th>
@@ -226,7 +229,7 @@ export default function SearchHistory() {
           <tbody>
             {logs.length === 0 && (
               <tr>
-                <td colSpan={8} className="text-center py-12" style={{ color: 'var(--text-tertiary)' }}>
+                <td colSpan={9} className="text-center py-12" style={{ color: 'var(--text-tertiary)' }}>
                   No search logs found
                 </td>
               </tr>
@@ -249,6 +252,15 @@ export default function SearchHistory() {
                     ) : '—'}
                   </td>
                   <td className="text-xs" style={{ color: 'var(--text-secondary)' }}>{l.tool_name || '—'}</td>
+                  <td className="text-xs">
+                    {l.api_key_name ? (
+                      <span className="glass-badge" style={{ background: 'rgba(52,199,89,0.08)', color: 'var(--accent-green)' }}>
+                        {l.api_key_name}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--text-tertiary)' }}>{l.api_key_id ? 'revoked' : '—'}</span>
+                    )}
+                  </td>
                   <td className="font-mono text-xs" style={{ color: 'var(--text-secondary)' }}>{l.ip_address}</td>
                   <td><StatusBadge code={l.status_code} /></td>
                   <td><LatencyBadge ms={l.elapsed_ms} /></td>

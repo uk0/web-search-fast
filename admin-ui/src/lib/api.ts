@@ -66,6 +66,7 @@ export interface Stats {
 export interface SearchLog {
   id: number
   api_key_id: string | null
+  api_key_name: string | null
   query: string
   engine: string | null
   ip_address: string

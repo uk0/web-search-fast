@@ -189,13 +189,13 @@ async def list_search_logs(
     params: list = []
 
     if query_filter:
-        conditions.append("query LIKE ?")
+        conditions.append("search_logs.query LIKE ?")
         params.append(f"%{query_filter}%")
     if ip_filter:
-        conditions.append("ip_address = ?")
+        conditions.append("search_logs.ip_address = ?")
         params.append(ip_filter)
     if key_filter:
-        conditions.append("api_key_id = ?")
+        conditions.append("search_logs.api_key_id = ?")
         params.append(key_filter)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -204,8 +204,12 @@ async def list_search_logs(
     total = count_rows[0]["cnt"]
 
     offset = (page - 1) * page_size
+    # LEFT JOIN api_keys to surface the calling key's name (kept even if the
+    # key was later revoked/deleted → name becomes NULL).
     rows = await db.execute_fetchall(
-        f"SELECT * FROM search_logs {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        "SELECT search_logs.*, api_keys.name AS api_key_name "
+        "FROM search_logs LEFT JOIN api_keys ON search_logs.api_key_id = api_keys.id "
+        f"{where} ORDER BY search_logs.created_at DESC LIMIT ? OFFSET ?",
         [*params, page_size, offset],
     )
     items = [
@@ -217,6 +221,7 @@ async def list_search_logs(
             request_body=r["request_body"] if "request_body" in r.keys() else None,
             response_body=r["response_body"] if "response_body" in r.keys() else None,
             tool_name=r["tool_name"] if "tool_name" in r.keys() else None,
+            api_key_name=r["api_key_name"] if "api_key_name" in r.keys() else None,
             created_at=r["created_at"],
         )
         for r in rows

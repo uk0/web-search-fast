@@ -29,6 +29,7 @@ class APIKeyCreated(APIKeyOut):
 class SearchLogOut(BaseModel):
     id: int
     api_key_id: str | None = None
+    api_key_name: str | None = None
     query: str
     engine: str | None = None
     ip_address: str
