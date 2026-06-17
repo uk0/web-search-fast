@@ -122,8 +122,30 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     logger.info("[lifespan] session ending")
 
 
+async def _pool_from_ctx(ctx: "Context | None") -> BrowserPool:
+    """Return the shared browser pool.
+
+    Works in both stateful and stateless HTTP modes: prefer the session
+    lifespan context, but fall back to the module singleton when it's absent
+    (stateless requests don't carry a populated lifespan context).
+    """
+    try:
+        if ctx is not None:
+            pool = ctx.request_context.lifespan_context.get("pool")
+            if pool is not None:
+                return pool
+    except Exception:
+        pass
+    return await _ensure_pool()
+
+
 mcp = FastMCP(
     "web-search-fast",
+    # Stateless HTTP: each request is independent (no mcp-session-id to track),
+    # so a server restart/redeploy never invalidates a client session — no
+    # "Session not found" errors. Our tools are independent request/response
+    # calls over a shared singleton pool, so no per-session state is needed.
+    stateless_http=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
@@ -176,7 +198,7 @@ async def web_search(
     from src.formatter.json_fmt import format_json
     from src.formatter.markdown_fmt import format_markdown
 
-    pool: BrowserPool = ctx.request_context.lifespan_context["pool"]
+    pool = await _pool_from_ctx(ctx)
     logger.debug("[web_search] pool acquired, _started=%s", pool._started)
 
     try:
@@ -228,7 +250,7 @@ async def get_page_content(
 
     from src.core.search import fetch_url_content
 
-    pool: BrowserPool = ctx.request_context.lifespan_context["pool"]
+    pool = await _pool_from_ctx(ctx)
 
     try:
         content = await fetch_url_content(pool, url, timeout=20)
@@ -253,7 +275,7 @@ async def list_search_engines(
     """List available search engines."""
     from src.core.search import ENGINES
 
-    pool: BrowserPool = ctx.request_context.lifespan_context["pool"]
+    pool = await _pool_from_ctx(ctx)
     stats = pool.stats
     lines = [
         "# Available Search Engines",
