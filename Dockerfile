@@ -103,7 +103,10 @@ COPY --from=builder /build/mcp_server.dist/ /app/bin/
 
 # Fetch Camoufox browser binary (needs pip camoufox for the fetch command)
 RUN pip install --no-cache-dir "camoufox[geoip]>=0.4.11" && \
-    python -m camoufox fetch
+    python -m camoufox fetch && \
+    CB="$(python -c 'import playwright,os;print(os.path.join(os.path.dirname(playwright.__file__),"driver/package/lib/coreBundle.js"))')" && \
+    sed -i 's/pageError\.location\.url/(pageError.location||{}).url/g; s/pageError\.location\.lineNumber/(pageError.location||{}).lineNumber/g; s/pageError\.location\.columnNumber/(pageError.location||{}).columnNumber/g' "$CB" && \
+    echo "patched playwright pageError null-guard (prevents driver crash on location-less page errors)"
 
 ENV MCP_HOST="0.0.0.0" \
     MCP_PORT="8897" \

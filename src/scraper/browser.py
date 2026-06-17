@@ -121,6 +121,12 @@ class BrowserPool:
         if self._block_images:
             kwargs["block_images"] = True
             kwargs["i_know_what_im_doing"] = True
+        # WebRTC leak guard: under proxy rotation geoip is off at launch, so
+        # Camoufox can't spoof the WebRTC IP to match the (per-context) proxy.
+        # Block WebRTC entirely so the real host IP can't leak past the proxy.
+        # Without rotation, geoip=True already spoofs WebRTC to the exit IP.
+        if self._proxy_rotator:
+            kwargs["block_webrtc"] = True
         if self._proxy and not self._proxy_rotator:
             kwargs["proxy"] = {"server": self._proxy}
         if self._os_target:

@@ -22,16 +22,20 @@ class GoogleSearchEngine(BaseSearchEngine):
     """Google search engine implementation."""
 
     name: str = "google"
-    # Google's SERP is JS-hydrated; wait for the result container to populate.
-    ready_selector: str = "#rso h3, #search h3"
+    # Wait for any anchor-wrapped result title to render (works for both the
+    # classic SERP and the udm=14 "Web" view).
+    ready_selector: str = "a[href] h3"
     ready_timeout_ms: int = 6_000
     warmup_homepage: bool = _WARMUP_HOMEPAGE
 
     def build_search_url(self, query: str, page: int = 1) -> str:
         encoded_query = quote_plus(query)
         start = (page - 1) * 10
-        # hl=en pins the SERP language; gl/lr left default so locale follows Camoufox.
-        url = f"https://www.google.com/search?q={encoded_query}&num=10&hl=en"
+        # udm=14 = Google's "Web" filter: classic blue-link results only — no
+        # AI overview, shopping, recipe, or rich blocks. Gives a consistent ~10
+        # organic results per query (vs 1-10 wildly varying on the default SERP)
+        # and a much lighter page (faster, less JS). hl=en pins SERP language.
+        url = f"https://www.google.com/search?q={encoded_query}&udm=14&hl=en"
         if start > 0:
             url += f"&start={start}"
         return url
@@ -155,34 +159,42 @@ class GoogleSearchEngine(BaseSearchEngine):
             logger.warning("[google] blocked at parse stage: %s", page.url[:120])
             return results
 
-        # Use JS-based extraction — Google obfuscates CSS classes, so we
-        # walk the DOM from <h3> elements inside #rso instead.
+        # Class-agnostic extraction: an organic result is an <a href="http...">
+        # that wraps an <h3> title. Scoped to the results container to skip
+        # header/footer chrome. Works for both the classic SERP and udm=14.
         raw = await page.evaluate("""(maxResults) => {
-            const rso = document.querySelector('#rso');
-            if (!rso) return [];
+            const root = document.querySelector('#rso')
+                || document.querySelector('#search')
+                || document.querySelector('#center_col')
+                || document.body;
             const items = [];
-            const h3s = rso.querySelectorAll('h3');
-            for (const h3 of h3s) {
+            const seen = new Set();
+            for (const a of root.querySelectorAll('a[href^="http"]')) {
                 if (items.length >= maxResults) break;
-                const a = h3.closest('a');
-                if (!a || !a.href || !a.href.startsWith('http')) continue;
-                // Walk up to the top-level result container
-                let container = h3;
-                for (let i = 0; i < 10; i++) {
-                    if (!container.parentElement || container.parentElement === rso) break;
+                const h3 = a.querySelector('h3');
+                if (!h3) continue;
+                const url = a.href;
+                if (!url) continue;
+                if (url.includes('google.com/') || url.includes('/search?')
+                    || url.includes('/sorry/') || url.includes('webcache.')) continue;
+                if (seen.has(url)) continue;
+                const title = (h3.textContent || '').trim();
+                if (!title) continue;
+                seen.add(url);
+                // Walk up to the result container, take the longest descendant
+                // text block that isn't the title as the snippet.
+                let container = a;
+                for (let i = 0; i < 5 && container.parentElement; i++) {
                     container = container.parentElement;
                 }
-                // Extract snippet from longest <span> that isn't the title
                 let snippet = '';
-                const spans = container.querySelectorAll('span');
-                for (const s of spans) {
-                    const t = (s.textContent || '').trim();
-                    if (t.length > 50 && !t.includes(h3.textContent)) {
-                        snippet = t.substring(0, 300);
-                        break;
+                for (const el of container.querySelectorAll('div, span')) {
+                    const t = (el.textContent || '').trim();
+                    if (t.length > 60 && !t.includes(title) && t.length > snippet.length) {
+                        snippet = t;
                     }
                 }
-                items.push({title: h3.textContent || '', url: a.href, snippet});
+                items.push({title, url, snippet: snippet.substring(0, 300)});
             }
             return items;
         }""", max_results)
