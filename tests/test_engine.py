@@ -14,7 +14,6 @@ class TestGoogleEngine:
         assert "google.com/search" in url
         assert "hello+world" in url or "hello%20world" in url
         assert "hl=en" in url
-        assert "udm=14" in url  # Web filter for consistent organic results
 
     def test_name(self):
         assert GoogleSearchEngine().name == "google"

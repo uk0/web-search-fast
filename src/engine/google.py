@@ -31,11 +31,11 @@ class GoogleSearchEngine(BaseSearchEngine):
     def build_search_url(self, query: str, page: int = 1) -> str:
         encoded_query = quote_plus(query)
         start = (page - 1) * 10
-        # udm=14 = Google's "Web" filter: classic blue-link results only — no
-        # AI overview, shopping, recipe, or rich blocks. Gives a consistent ~10
-        # organic results per query (vs 1-10 wildly varying on the default SERP)
-        # and a much lighter page (faster, less JS). hl=en pins SERP language.
-        url = f"https://www.google.com/search?q={encoded_query}&udm=14&hl=en"
+        # Default SERP. (udm=14 "Web filter" was tried but Google CAPTCHA-blocks
+        # it far more aggressively than the default page, tanking success rate —
+        # see scripts/diag_udm*. Result-count regularity is handled instead by
+        # the insufficient-results fallback in core.search.) hl=en pins language.
+        url = f"https://www.google.com/search?q={encoded_query}&hl=en"
         if start > 0:
             url += f"&start={start}"
         return url

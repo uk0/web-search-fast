@@ -59,11 +59,18 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
     logger.info("[search] start: query=%r engine=%s depth=%d max_results=%d timeout=%ds",
                 req.query[:80], req.engine.value, req.depth, req.max_results, total_timeout)
 
+    # Treat a SERP as "good enough" at half the requested results (min 3).
+    # Below this, a sparse/blocked engine (e.g. Google on a shopping-heavy
+    # query returning 1 organic link) falls through to the next engine, and
+    # we keep whichever produced the most results — regularizing the count.
+    sufficient = max(3, min(req.max_results, req.max_results // 2 + 1))
+
     async def _serp_phase() -> tuple[list, SearchEngine]:
         """One page acquisition + engine chain.
 
-        Proxy-caused failures abort the whole chain immediately (every
-        engine shares the page, hence the same dead proxy) and bubble up
+        Returns the first engine result set that meets `sufficient`; if none
+        do, returns the largest set seen (best effort). Proxy-caused failures
+        abort the chain immediately (the page's proxy is dead) and bubble up
         so the caller can retry on a fresh page/proxy.
         """
         from src.scraper.proxy import is_proxy_error
@@ -71,6 +78,8 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
         engine_chain = [req.engine] + FALLBACK_ORDER.get(req.engine, [])
         async with pool.acquire() as page:
             last_exc: Exception | None = None
+            best_results: list = []
+            best_engine = req.engine
             for eng_key in engine_chain:
                 engine = ENGINES[eng_key]
                 try:
@@ -85,12 +94,15 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
                         raise
                     logger.warning("[search] engine %s failed: %s", eng_key.value, exc)
                     continue
-                if results:
+                if len(results) > len(best_results):
+                    best_results, best_engine = results, eng_key
+                if len(results) >= sufficient:
                     return results, eng_key
-                logger.info("[search] engine %s returned 0 results", eng_key.value)
-            if last_exc is not None:
+                logger.info("[search] engine %s returned %d (<%d) results, trying fallback",
+                            eng_key.value, len(results), sufficient)
+            if not best_results and last_exc is not None:
                 raise last_exc
-            return [], req.engine
+            return best_results, best_engine
 
     async def _inner() -> SearchResponse:
         from src.scraper.proxy import is_proxy_error
