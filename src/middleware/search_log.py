@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 # Only log requests to MCP endpoints
 _LOG_PREFIXES = ("/mcp",)
 
+# Auth/limit rejections never ran a real search — don't record them as requests.
+_SKIP_LOG_STATUSES = frozenset({401, 403, 429})
+
 
 class SearchLogMiddleware:
     """Pure ASGI middleware that logs ALL MCP requests with request/response bodies."""
@@ -73,12 +76,17 @@ class SearchLogMiddleware:
             await self.app(scope, receive_replay, send_wrapper)
         finally:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
-            try:
-                asyncio.create_task(self._log_request(
-                    request, request_body, response_chunks, status_code, elapsed_ms,
-                ))
-            except Exception as e:
-                logger.debug("Failed to schedule log request: %s", e)
+            # Skip auth/limit rejections (401/403/429) — they didn't run a search
+            # and must not pollute the valid-request log or stats.
+            if status_code in _SKIP_LOG_STATUSES:
+                logger.debug("[search_log] skipping %d (auth/limit rejection)", status_code)
+            else:
+                try:
+                    asyncio.create_task(self._log_request(
+                        request, request_body, response_chunks, status_code, elapsed_ms,
+                    ))
+                except Exception as e:
+                    logger.debug("Failed to schedule log request: %s", e)
 
     async def _log_request(
         self,

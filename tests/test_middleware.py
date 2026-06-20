@@ -196,6 +196,29 @@ class TestSearchLogMiddleware:
         logs = await list_search_logs()
         assert logs.total == 0
 
+    @pytest.mark.asyncio
+    async def test_skips_auth_rejections(self):
+        # 401/403/429 are auth/limit rejections — must NOT be logged as requests.
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        from src.admin.repository import list_search_logs
+        from src.middleware.search_log import SearchLogMiddleware
+
+        async def rejected(request):
+            return JSONResponse({"error": "Invalid token"}, status_code=403)
+
+        app = Starlette(routes=[Route("/mcp", rejected, methods=["POST"])])
+        app.add_middleware(SearchLogMiddleware)
+        client = TestClient(app)
+        resp = client.post("/mcp", json={"jsonrpc": "2.0", "method": "tools/call", "id": 1})
+        assert resp.status_code == 403
+
+        logs = await list_search_logs()
+        assert logs.total == 0  # rejection not recorded
+
 
 # --- Helpers ---
 

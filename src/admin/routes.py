@@ -64,10 +64,15 @@ async def create_key(request: Request) -> JSONResponse:
 
 async def delete_key(request: Request) -> JSONResponse:
     key_id = request.path_params["key_id"]
-    ok = await repository.revoke_api_key(key_id)
+    # ?hard=true permanently removes the row; default revokes (is_active=0)
+    hard = request.query_params.get("hard", "").lower() in ("1", "true", "yes")
+    if hard:
+        ok = await repository.delete_api_key(key_id)
+    else:
+        ok = await repository.revoke_api_key(key_id)
     if not ok:
         return JSONResponse({"error": "Key not found"}, status_code=404)
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "deleted": hard})
 
 
 async def update_key(request: Request) -> JSONResponse:
@@ -106,6 +111,13 @@ async def delete_ip_ban(request: Request) -> JSONResponse:
     if not ok:
         return JSONResponse({"error": "IP not found in ban list"}, status_code=404)
     return JSONResponse({"ok": True})
+
+
+# --- DB Health ---
+
+async def get_db_health(request: Request) -> JSONResponse:
+    health = await repository.get_db_health()
+    return JSONResponse(health)
 
 
 # --- System Info ---
@@ -245,6 +257,7 @@ async def _reload_proxies() -> None:
 
 admin_routes = [
     Route("/admin/api/stats", get_stats, methods=["GET"]),
+    Route("/admin/api/db-health", get_db_health, methods=["GET"]),
     Route("/admin/api/search-logs", list_search_logs, methods=["GET"]),
     Route("/admin/api/keys", list_keys, methods=["GET"]),
     Route("/admin/api/keys", create_key, methods=["POST"]),

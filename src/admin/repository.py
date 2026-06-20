@@ -140,6 +140,14 @@ async def set_api_key_active(key_id: str, is_active: bool) -> bool:
     return cursor.rowcount > 0
 
 
+async def delete_api_key(key_id: str) -> bool:
+    """Permanently remove an API key row (hard delete, vs. revoke)."""
+    db = await get_db()
+    cursor = await db.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Search Logs
 # ---------------------------------------------------------------------------
@@ -324,6 +332,42 @@ async def list_bans() -> list[IPBanOut]:
 # ---------------------------------------------------------------------------
 # Dashboard Stats
 # ---------------------------------------------------------------------------
+
+
+async def get_db_health() -> dict:
+    """Report DB integrity, table row counts, file size, and WAL/journal mode."""
+    import os as _os
+
+    from src.admin.database import DB_PATH
+
+    db = await get_db()
+    health: dict = {"ok": True, "integrity": "unknown", "tables": {}, "size_bytes": 0,
+                    "journal_mode": "unknown"}
+    try:
+        rows = await db.execute_fetchall("PRAGMA integrity_check")
+        health["integrity"] = rows[0][0] if rows else "unknown"
+        health["ok"] = health["integrity"] == "ok"
+    except Exception as exc:
+        health["ok"] = False
+        health["integrity"] = f"error: {exc}"
+    for table in ("api_keys", "search_logs", "ip_bans", "proxies"):
+        try:
+            r = await db.execute_fetchall(f"SELECT COUNT(*) AS c FROM {table}")
+            health["tables"][table] = r[0]["c"]
+        except Exception:
+            health["tables"][table] = -1
+    try:
+        jm = await db.execute_fetchall("PRAGMA journal_mode")
+        health["journal_mode"] = jm[0][0] if jm else "unknown"
+    except Exception:
+        pass
+    try:
+        path = DB_PATH
+        if _os.path.exists(path):
+            health["size_bytes"] = _os.path.getsize(path)
+    except Exception:
+        pass
+    return health
 
 
 async def get_stats() -> DashboardStats:

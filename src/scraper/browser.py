@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -42,6 +43,15 @@ _SCALE_COOLDOWN_SECS = 10    # minimum seconds between scaling events
 # Resource types aborted when block_resources is on — never needed for text
 # extraction. Scripts/stylesheets are kept (Google/Bing hydrate via JS).
 _BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+
+# Memory-leak guard: a long-lived Firefox accumulates memory across thousands
+# of contexts. Recycle (restart) the browser once it has served this many
+# requests — but only while idle (no active tabs), so live searches aren't
+# disrupted. 0 disables. Env: BROWSER_RECYCLE_AFTER.
+try:
+    _RECYCLE_AFTER_REQUESTS = int(os.environ.get("BROWSER_RECYCLE_AFTER", "1000"))
+except ValueError:
+    _RECYCLE_AFTER_REQUESTS = 1000
 
 
 class BrowserPool:
@@ -98,6 +108,8 @@ class BrowserPool:
         # Bumped on every successful start — lets concurrent dead-browser
         # detectors dedupe: only one restart runs per dead generation.
         self._browser_generation = 0
+        self._recycle_count = 0
+        self._requests_at_last_start = 0
         self._active_tabs = 0
         # --- auto-scaling ---
         self._last_scale_time = 0.0
@@ -154,6 +166,7 @@ class BrowserPool:
         self._browser = await self._camoufox.__aenter__()
         self._started = True
         self._browser_generation += 1
+        self._requests_at_last_start = self._total_requests
         elapsed = (time.monotonic() - t0) * 1000
         logger.info(
             "[pool] started in %.0fms: pool_size=%d, geoip=%s, humanize=%s, "
@@ -258,7 +271,14 @@ class BrowserPool:
             "total_failures": self._total_failures,
             "consecutive_failures": self._consecutive_failures,
             "restart_count": self._restart_count,
+            "recycle_count": self._recycle_count,
+            "generation": self._browser_generation,
             "proxy_count": self._proxy_rotator.count if self._proxy_rotator else 0,
+            # Configured fingerprint/perf defaults of the initialized instance
+            "block_resources": self._block_resources,
+            "block_webrtc": bool(self._proxy_rotator),
+            "geo_fingerprint": self._geo_fingerprint,
+            "headless": self._headless,
         }
 
     def set_stats_callback(self, callback) -> None:
@@ -355,6 +375,31 @@ class BrowserPool:
         except Exception as exc:
             logger.debug("[pool] resource blocker install failed: %s", exc)
 
+    async def _maybe_recycle(self) -> None:
+        """Recycle the browser to free accumulated memory — only when idle.
+
+        Triggered once the browser has served _RECYCLE_AFTER_REQUESTS requests
+        since its last (re)start AND no tabs are currently active, so live
+        searches are never interrupted. Counts as a recycle, not a failure.
+        """
+        if _RECYCLE_AFTER_REQUESTS <= 0 or not self._started:
+            return
+        served = self._total_requests - self._requests_at_last_start
+        if served < _RECYCLE_AFTER_REQUESTS or self._active_tabs > 0:
+            return
+        async with self._restart_lock:
+            # Re-check under lock (another coroutine may have recycled/restarted)
+            served = self._total_requests - self._requests_at_last_start
+            if served < _RECYCLE_AFTER_REQUESTS or self._active_tabs > 0 or not self._started:
+                return
+            self._recycle_count += 1
+            logger.info("[pool] recycling browser (memory guard) after %d requests (recycle #%d)",
+                        served, self._recycle_count)
+            await self.stop()
+            await self.start()
+            self._consecutive_failures = 0
+            self._last_restart_time = time.monotonic()
+
     async def _maybe_scale_up(self) -> None:
         """Increase semaphore capacity if utilization is high."""
         if self._pool_size >= self._max_pool_size:
@@ -398,6 +443,10 @@ class BrowserPool:
         if self.needs_restart:
             logger.warning("[pool] req#%d — too many failures, triggering restart before acquire", req_id)
             await self.restart()
+
+        # Memory-leak guard: recycle the browser after enough requests, but only
+        # while idle so no live search is interrupted.
+        await self._maybe_recycle()
 
         # Auto-scale up if utilization is high
         await self._maybe_scale_up()

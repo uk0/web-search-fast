@@ -81,6 +81,14 @@ async def init_db(db_path: str | None = None) -> None:
     logger.info("Initializing SQLite database at %s", path)
     _db = await aiosqlite.connect(path)
     _db.row_factory = aiosqlite.Row
+    # WAL + NORMAL: concurrent reads during writes, durable, fewer "database is
+    # locked" errors under the search-log + admin write mix.
+    try:
+        await _db.execute("PRAGMA journal_mode=WAL")
+        await _db.execute("PRAGMA synchronous=NORMAL")
+        await _db.execute("PRAGMA busy_timeout=5000")
+    except Exception as exc:
+        logger.warning("Failed to set WAL pragmas: %s", exc)
     await _db.executescript(_SCHEMA)
     await _db.commit()
     # Migrate: add new columns if missing (for existing databases)

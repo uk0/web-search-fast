@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "web-search-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "High-performance web search to JSON/Markdown service powered by Camoufox and FastAPI"
 requires-python = ">=3.10"
 dependencies = [

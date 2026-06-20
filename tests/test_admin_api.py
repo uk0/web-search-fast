@@ -160,6 +160,31 @@ class TestAPIKeysEndpoints:
             )
             assert resp.status_code == 404
 
+    def test_hard_delete_removes_key(self, client, auth_headers):
+        with _patch_admin_token():
+            kid = client.post("/admin/api/keys", json={"name": "to-nuke"},
+                              headers=auth_headers).json()["id"]
+            # soft revoke keeps the row
+            client.delete(f"/admin/api/keys/{kid}", headers=auth_headers)
+            assert len(client.get("/admin/api/keys", headers=auth_headers).json()) == 1
+            # hard delete removes it
+            resp = client.delete(f"/admin/api/keys/{kid}?hard=true", headers=auth_headers)
+            assert resp.status_code == 200
+            assert resp.json()["deleted"] is True
+            assert len(client.get("/admin/api/keys", headers=auth_headers).json()) == 0
+
+
+class TestDBHealth:
+    def test_db_health(self, client, auth_headers):
+        with _patch_admin_token():
+            resp = client.get("/admin/api/db-health", headers=auth_headers)
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["ok"] is True
+        assert d["integrity"] == "ok"
+        assert "api_keys" in d["tables"]
+        assert "search_logs" in d["tables"]
+
 
 class TestProxiesEndpoints:
     def test_import_and_list_proxies(self, client, auth_headers):
