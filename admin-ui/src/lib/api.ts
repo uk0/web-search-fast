@@ -33,12 +33,14 @@ export const api = {
   getKeys: () => request<APIKey[]>('/keys'),
   createKey: (data: { name: string; call_limit: number }) =>
     request<APIKeyCreated>('/keys', { method: 'POST', body: JSON.stringify(data) }),
-  deleteKey: (id: string) => request<{ ok: boolean }>(`/keys/${id}`, { method: 'DELETE' }),
+  deleteKey: (id: string, hard = false) =>
+    request<{ ok: boolean; deleted?: boolean }>(`/keys/${id}${hard ? '?hard=true' : ''}`, { method: 'DELETE' }),
   setKeyActive: (id: string, is_active: boolean) =>
     request<{ ok: boolean; is_active: boolean }>(`/keys/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ is_active }),
     }),
+  getDbHealth: () => request<DbHealth>('/db-health'),
   getBans: () => request<IPBan[]>('/ip-bans'),
   banIP: (data: { ip: string; reason: string }) =>
     request<IPBan>('/ip-bans', { method: 'POST', body: JSON.stringify(data) }),
@@ -121,7 +123,22 @@ export interface SystemInfo {
     total_failures: number
     consecutive_failures: number
     restart_count: number
+    recycle_count?: number
+    generation?: number
+    proxy_count?: number
+    block_resources?: boolean
+    block_webrtc?: boolean
+    geo_fingerprint?: boolean
+    headless?: boolean
   }
+}
+
+export interface DbHealth {
+  ok: boolean
+  integrity: string
+  journal_mode: string
+  size_bytes: number
+  tables: Record<string, number>
 }
 
 export interface TimelinePoint {

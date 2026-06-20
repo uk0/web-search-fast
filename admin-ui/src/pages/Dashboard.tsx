@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { api, type Stats, type SearchLog, type SystemInfo, type Analytics } from '@/lib/api'
+import { api, type Stats, type SearchLog, type SystemInfo, type Analytics, type DbHealth } from '@/lib/api'
 import {
   Search, Key, ShieldBan, Activity, Monitor, Globe,
-  TrendingUp, Zap, BarChart3,
+  TrendingUp, Zap, BarChart3, Database, Cpu, CheckCircle2, XCircle,
 } from 'lucide-react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
@@ -50,6 +50,7 @@ export default function Dashboard() {
   const [logs, setLogs] = useState<SearchLog[]>([])
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null)
   const [analytics, setAnalytics] = useState<Analytics | null>(null)
+  const [dbHealth, setDbHealth] = useState<DbHealth | null>(null)
   const [timeRange, setTimeRange] = useState<'24h' | '7d'>('24h')
   const [error, setError] = useState('')
 
@@ -58,9 +59,11 @@ export default function Dashboard() {
     api.getSearchLogs({ page_size: '5' }).then((r) => setLogs(r.items)).catch(() => {})
     api.getSystem().then(setSystemInfo).catch(() => {})
     api.getAnalytics(24).then(setAnalytics).catch(() => {})
+    api.getDbHealth().then(setDbHealth).catch(() => {})
 
     const sysInterval = setInterval(() => {
       api.getSystem().then(setSystemInfo).catch(() => {})
+      api.getDbHealth().then(setDbHealth).catch(() => {})
     }, 10000)
     const analyticsInterval = setInterval(() => {
       const hours = timeRange === '7d' ? 168 : 24
@@ -192,6 +195,87 @@ export default function Dashboard() {
               )}
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Browser instance + Database health */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Browser instance detail */}
+        <div className="glass p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Cpu className="h-5 w-5" style={{ color: 'var(--accent-teal)' }} />
+            <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Browser Instance</h2>
+            {systemInfo && (
+              <span className="glass-badge ml-auto" style={{
+                background: systemInfo.pool.started ? 'rgba(52,199,89,0.1)' : 'rgba(255,59,48,0.1)',
+                color: systemInfo.pool.started ? 'var(--accent-green)' : 'var(--accent-red)',
+              }}>{systemInfo.pool.started ? 'running' : 'down'}</span>
+            )}
+          </div>
+          {systemInfo ? (
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 text-sm">
+              {[
+                ['Pool (active / size / max)', `${systemInfo.pool.active_tabs} / ${systemInfo.pool.pool_size} / ${systemInfo.pool.max_pool_size}`],
+                ['Total requests', systemInfo.pool.total_requests.toLocaleString()],
+                ['Total failures', systemInfo.pool.total_failures.toLocaleString()],
+                ['Restarts / Recycles', `${systemInfo.pool.restart_count} / ${systemInfo.pool.recycle_count ?? 0}`],
+                ['Generation', String(systemInfo.pool.generation ?? '—')],
+                ['Proxies', String(systemInfo.pool.proxy_count ?? 0)],
+              ].map(([k, v]) => (
+                <div key={k} className="flex items-center justify-between border-b py-1" style={{ borderColor: 'rgba(0,0,0,0.04)' }}>
+                  <span style={{ color: 'var(--text-tertiary)' }}>{k}</span>
+                  <span className="font-mono font-medium" style={{ color: 'var(--text-primary)' }}>{v}</span>
+                </div>
+              ))}
+              <div className="col-span-2 flex flex-wrap gap-1.5 mt-1">
+                {[
+                  ['headless', systemInfo.pool.headless],
+                  ['geo-fingerprint', systemInfo.pool.geo_fingerprint],
+                  ['block-resources', systemInfo.pool.block_resources],
+                  ['block-webrtc', systemInfo.pool.block_webrtc],
+                ].map(([label, on]) => (
+                  <span key={String(label)} className="glass-badge text-[11px]" style={{
+                    background: on ? 'rgba(52,199,89,0.1)' : 'rgba(0,0,0,0.05)',
+                    color: on ? 'var(--accent-green)' : 'var(--text-tertiary)',
+                  }}>{on ? '✓' : '○'} {label}</span>
+                ))}
+              </div>
+            </div>
+          ) : <p className="text-sm" style={{ color: 'var(--text-tertiary)' }}>Loading…</p>}
+        </div>
+
+        {/* Database health */}
+        <div className="glass p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Database className="h-5 w-5" style={{ color: 'var(--accent-blue)' }} />
+            <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Database</h2>
+            {dbHealth && (
+              <span className="glass-badge ml-auto inline-flex items-center gap-1" style={{
+                background: dbHealth.ok ? 'rgba(52,199,89,0.1)' : 'rgba(255,59,48,0.1)',
+                color: dbHealth.ok ? 'var(--accent-green)' : 'var(--accent-red)',
+              }}>
+                {dbHealth.ok ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
+                {dbHealth.ok ? 'healthy' : 'issue'}
+              </span>
+            )}
+          </div>
+          {dbHealth ? (
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 text-sm">
+              {[
+                ['Integrity', dbHealth.integrity],
+                ['Journal mode', dbHealth.journal_mode],
+                ['Size', `${(dbHealth.size_bytes / 1024 / 1024).toFixed(2)} MB`],
+                ['Search logs', String(dbHealth.tables.search_logs ?? '—')],
+                ['API keys', String(dbHealth.tables.api_keys ?? '—')],
+                ['Proxies / IP bans', `${dbHealth.tables.proxies ?? '—'} / ${dbHealth.tables.ip_bans ?? '—'}`],
+              ].map(([k, v]) => (
+                <div key={k} className="flex items-center justify-between border-b py-1" style={{ borderColor: 'rgba(0,0,0,0.04)' }}>
+                  <span style={{ color: 'var(--text-tertiary)' }}>{k}</span>
+                  <span className="font-mono font-medium" style={{ color: 'var(--text-primary)' }}>{v}</span>
+                </div>
+              ))}
+            </div>
+          ) : <p className="text-sm" style={{ color: 'var(--text-tertiary)' }}>Loading…</p>}
         </div>
       </div>
 

@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { api, type APIKey, type APIKeyCreated } from '@/lib/api'
-import { Key, Plus, Trash2, Copy, Check, RotateCw } from 'lucide-react'
+import { Key, Plus, Trash2, Copy, Check, RotateCw, X } from 'lucide-react'
 
 export default function APIKeys() {
   const [keys, setKeys] = useState<APIKey[]>([])
@@ -30,6 +30,12 @@ export default function APIKeys() {
 
   const handleActivate = async (id: string) => {
     await api.setKeyActive(id, true)
+    load()
+  }
+
+  const handleDelete = async (id: string, name: string) => {
+    if (!confirm(`Permanently delete key "${name}"? This cannot be undone.`)) return
+    await api.deleteKey(id, true)
     load()
   }
 
@@ -143,25 +149,37 @@ export default function APIKeys() {
                   {new Date(k.created_at).toLocaleString()}
                 </td>
                 <td>
-                  {k.is_active ? (
+                  <div className="flex items-center gap-1">
+                    {k.is_active ? (
+                      <button
+                        className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
+                        style={{ color: 'var(--accent-orange)' }}
+                        onClick={() => handleRevoke(k.id)}
+                        title="Revoke (disable, keep record)"
+                      >
+                        <X className="h-3 w-3" />
+                        Revoke
+                      </button>
+                    ) : (
+                      <button
+                        className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
+                        style={{ color: 'var(--accent-green)' }}
+                        onClick={() => handleActivate(k.id)}
+                        title="Reactivate"
+                      >
+                        <RotateCw className="h-3 w-3" />
+                        Activate
+                      </button>
+                    )}
                     <button
-                      className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
+                      className="glass-btn glass-btn-ghost px-2 py-1 text-xs flex items-center"
                       style={{ color: 'var(--accent-red)' }}
-                      onClick={() => handleRevoke(k.id)}
+                      onClick={() => handleDelete(k.id, k.name)}
+                      title="Delete permanently"
                     >
                       <Trash2 className="h-3 w-3" />
-                      Revoke
                     </button>
-                  ) : (
-                    <button
-                      className="glass-btn glass-btn-ghost px-2.5 py-1 text-xs flex items-center gap-1"
-                      style={{ color: 'var(--accent-green)' }}
-                      onClick={() => handleActivate(k.id)}
-                    >
-                      <RotateCw className="h-3 w-3" />
-                      Activate
-                    </button>
-                  )}
+                  </div>
                 </td>
               </tr>
             ))}
