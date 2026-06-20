@@ -81,12 +81,25 @@ async def init_db(db_path: str | None = None) -> None:
     logger.info("Initializing SQLite database at %s", path)
     _db = await aiosqlite.connect(path)
     _db.row_factory = aiosqlite.Row
+    await _db.execute("PRAGMA busy_timeout=5000")
+    # Self-heal historical bloat: with retention capping rows, the file should
+    # never exceed a few MB. If it's oversized (freed pages from pre-retention
+    # data that couldn't be truncated while the app held the file open), VACUUM
+    # now — startup is the only moment this connection is the sole opener, so
+    # the file can actually shrink.
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 50 * 1024 * 1024:
+            mb = os.path.getsize(path) / (1024 * 1024)
+            logger.info("DB is %.0fMB — running startup VACUUM to reclaim space", mb)
+            await _db.execute("VACUUM")
+            logger.info("VACUUM done: %.1fMB", os.path.getsize(path) / (1024 * 1024))
+    except Exception as exc:
+        logger.warning("Startup VACUUM skipped: %s", exc)
     # WAL + NORMAL: concurrent reads during writes, durable, fewer "database is
     # locked" errors under the search-log + admin write mix.
     try:
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA synchronous=NORMAL")
-        await _db.execute("PRAGMA busy_timeout=5000")
     except Exception as exc:
         logger.warning("Failed to set WAL pragmas: %s", exc)
     await _db.executescript(_SCHEMA)
