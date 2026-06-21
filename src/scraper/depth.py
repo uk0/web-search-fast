@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from playwright.async_api import Page
 
@@ -14,12 +15,45 @@ logger = logging.getLogger(__name__)
 # Limit concurrent depth-crawl fetches to avoid overwhelming the browser pool
 _DEPTH_CONCURRENCY = 5
 
+# Auto-scroll tuning for lazy-load / infinite-scroll pages
+_SCROLL_MAX_STEPS = 12
+_SCROLL_SETTLE_MS = 450  # wait after each scroll for content to load
 
-async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
+
+async def _auto_scroll(page: Page, deadline: float) -> None:
+    """Scroll to the bottom repeatedly to trigger lazy-load / infinite scroll.
+
+    Stops when the page height stops growing, the step cap is hit, or the time
+    deadline passes. Best-effort — any error just ends scrolling.
+    """
+    try:
+        prev_height = -1
+        for _ in range(_SCROLL_MAX_STEPS):
+            if time.monotonic() >= deadline:
+                break
+            height = await page.evaluate(
+                "() => { window.scrollTo(0, document.body.scrollHeight); "
+                "return document.body.scrollHeight; }"
+            )
+            await page.wait_for_timeout(_SCROLL_SETTLE_MS)
+            if not isinstance(height, (int, float)) or height <= prev_height:
+                break  # no new content loaded
+            prev_height = height
+        # Return to top so content extraction sees the full, settled DOM
+        await page.evaluate("() => window.scrollTo(0, 0)")
+    except Exception as exc:
+        logger.debug("auto-scroll skipped: %s", exc)
+
+
+async def fetch_page_content(
+    page: Page, url: str, timeout: int = 15, *, render: bool = False, scroll: bool = False,
+) -> str:
     """Fetch a single page and return its HTML content.
 
-    Uses 'domcontentloaded' for speed — most content is available without
-    waiting for all resources to load.
+    Default (depth-crawl) path uses 'domcontentloaded' for speed. For the
+    single-page get_page_content path, pass render=True to wait for JS-driven
+    content to settle (networkidle) and scroll=True to trigger lazy-load /
+    infinite-scroll content below the fold — both bounded by `timeout`.
 
     Site errors are swallowed (return "") — a dead target site is normal.
     Proxy-caused errors are re-raised when proxy rotation is active so the
@@ -28,6 +62,7 @@ async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
     from src.scraper.proxy import is_proxy_error
 
     rotating = bool(getattr(page, "_wsm_rotating", False))
+    deadline = time.monotonic() + timeout
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=min(timeout, 12) * 1000)
     except Exception as exc:
@@ -36,6 +71,20 @@ async def fetch_page_content(page: Page, url: str, timeout: int = 15) -> str:
             raise
         logger.warning("fetch_page_content failed for %s: %s", url, exc)
         return ""
+
+    if render:
+        # Let XHR/fetch-driven (SPA) content render. networkidle often won't
+        # fire on pages with long-poll/websocket traffic, so cap it short and
+        # treat the timeout as "settled enough" — non-fatal.
+        remaining = deadline - time.monotonic()
+        if remaining > 1:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=int(min(remaining, 4) * 1000))
+            except Exception:
+                pass
+    if scroll:
+        await _auto_scroll(page, deadline)
+
     try:
         return await page.content()
     except Exception as exc:

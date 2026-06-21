@@ -178,7 +178,8 @@ async def fetch_url_content(pool: BrowserPool, url: str, timeout: int = 30) -> s
     for attempt in (1, 2):
         try:
             async with pool.acquire() as page:
-                html = await fetch_page_content(page, url, timeout)
+                # Single-page reads render JS content + scroll for lazy-load
+                html = await fetch_page_content(page, url, timeout, render=True, scroll=True)
             break
         except Exception as exc:
             remaining = timeout - (time.monotonic() - t0)
