@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { api, type Stats, type SearchLog, type SystemInfo, type Analytics, type DbHealth } from '@/lib/api'
+import { api, type Stats, type SearchLog, type SystemInfo, type Analytics, type DbHealth, type TabsInfo } from '@/lib/api'
 import {
   Search, Key, ShieldBan, Activity, Monitor, Globe,
-  TrendingUp, Zap, BarChart3, Database, Cpu, CheckCircle2, XCircle,
+  TrendingUp, Zap, BarChart3, Database, Cpu, CheckCircle2, XCircle, Layers,
 } from 'lucide-react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
@@ -51,6 +51,7 @@ export default function Dashboard() {
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null)
   const [analytics, setAnalytics] = useState<Analytics | null>(null)
   const [dbHealth, setDbHealth] = useState<DbHealth | null>(null)
+  const [tabs, setTabs] = useState<TabsInfo | null>(null)
   const [timeRange, setTimeRange] = useState<'24h' | '7d'>('24h')
   const [error, setError] = useState('')
 
@@ -60,10 +61,12 @@ export default function Dashboard() {
     api.getSystem().then(setSystemInfo).catch(() => {})
     api.getAnalytics(24).then(setAnalytics).catch(() => {})
     api.getDbHealth().then(setDbHealth).catch(() => {})
+    api.getTabs().then(setTabs).catch(() => {})
 
     const sysInterval = setInterval(() => {
       api.getSystem().then(setSystemInfo).catch(() => {})
       api.getDbHealth().then(setDbHealth).catch(() => {})
+      api.getTabs().then(setTabs).catch(() => {})
     }, 10000)
     const analyticsInterval = setInterval(() => {
       const hours = timeRange === '7d' ? 168 : 24
@@ -396,6 +399,41 @@ export default function Dashboard() {
               ))}
             </tbody>
           </table>
+        )}
+      </div>
+
+      {/* Live browser tabs — instance(generation) / tab / session map */}
+      <div className="glass p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Layers className="h-5 w-5" style={{ color: 'var(--accent-teal)' }} />
+          <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Live Browser Tabs</h2>
+          {tabs && (
+            <span className="glass-badge ml-auto" style={{ background: 'rgba(90,200,250,0.1)', color: 'var(--accent-teal)' }}>
+              instance gen {tabs.generation} · {tabs.active} active
+            </span>
+          )}
+        </div>
+        {tabs && tabs.tabs.length > 0 ? (
+          <table className="glass-table">
+            <thead>
+              <tr><th>Tab</th><th>Instance (gen)</th><th>Req #</th><th>Session / Label</th><th>Age</th></tr>
+            </thead>
+            <tbody>
+              {tabs.tabs.map((t) => (
+                <tr key={t.tab_id}>
+                  <td className="font-mono text-xs">#{t.tab_id}</td>
+                  <td className="font-mono text-xs" style={{ color: 'var(--text-secondary)' }}>gen-{t.generation}</td>
+                  <td className="font-mono text-xs" style={{ color: 'var(--text-secondary)' }}>{t.req_id ?? '—'}</td>
+                  <td className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t.session || t.label || '—'}</td>
+                  <td className="text-xs" style={{ color: t.age_secs > 60 ? 'var(--accent-red)' : 'var(--text-tertiary)' }}>
+                    {t.age_secs.toFixed(1)}s
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="text-sm py-4 text-center" style={{ color: 'var(--text-tertiary)' }}>No active tabs</p>
         )}
       </div>
     </div>

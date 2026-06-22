@@ -298,6 +298,58 @@ class TestRestartCooldown:
             assert pool._restart_count == count
 
 
+class TestTabTracking:
+    @pytest.mark.asyncio
+    async def test_acquire_registers_and_deregisters_tab(self, mock_camoufox, mock_browser):
+        browser, page = mock_browser
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool(pool_size=2)
+            await pool.start()
+            assert pool.tab_details() == []
+            async with pool.acquire(label="search:foo", session="sess-1") as _:
+                details = pool.tab_details()
+                assert len(details) == 1
+                assert details[0]["label"] == "search:foo"
+                assert details[0]["session"] == "sess-1"
+                assert details[0]["generation"] == pool._browser_generation
+            # deregistered after exit
+            assert pool.tab_details() == []
+            assert pool._tab_high_water >= 1
+
+    @pytest.mark.asyncio
+    async def test_reap_closes_stale_tab(self, mock_camoufox, mock_browser):
+        import time as _t
+        browser, page = mock_browser
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool(pool_size=2)
+            await pool.start()
+            stale_page = AsyncMock()
+            pool._tab_registry[999] = {
+                "tab_id": 999, "generation": pool._browser_generation, "req_id": 1,
+                "session": None, "label": "leaked", "page": stale_page,
+                "started_at": _t.monotonic() - 999,  # way past lifetime
+            }
+            reaped = await pool._reap_once()
+            assert reaped == 1
+            assert 999 not in pool._tab_registry
+            stale_page.close.assert_awaited_once()
+            assert pool._leaked_reaped == 1
+
+    @pytest.mark.asyncio
+    async def test_reap_keeps_fresh_tab(self, mock_camoufox, mock_browser):
+        import time as _t
+        browser, page = mock_browser
+        with patch("src.scraper.browser.AsyncCamoufox", return_value=mock_camoufox):
+            pool = BrowserPool(pool_size=2)
+            await pool.start()
+            pool._tab_registry[1] = {
+                "tab_id": 1, "generation": 1, "req_id": 1, "session": None,
+                "label": "fresh", "page": AsyncMock(), "started_at": _t.monotonic(),
+            }
+            assert await pool._reap_once() == 0
+            assert 1 in pool._tab_registry
+
+
 class TestProxyRotatorCircuitBreaker:
     def _mk(self, n=3):
         from src.scraper.proxy import ProxyRotator

@@ -41,6 +41,7 @@ export const api = {
       body: JSON.stringify({ is_active }),
     }),
   getDbHealth: () => request<DbHealth>('/db-health'),
+  getTabs: () => request<TabsInfo>('/tabs'),
   getBans: () => request<IPBan[]>('/ip-bans'),
   banIP: (data: { ip: string; reason: string }) =>
     request<IPBan>('/ip-bans', { method: 'POST', body: JSON.stringify(data) }),
@@ -139,6 +140,21 @@ export interface DbHealth {
   journal_mode: string
   size_bytes: number
   tables: Record<string, number>
+}
+
+export interface TabInfo {
+  tab_id: number
+  generation: number
+  req_id: number | null
+  session: string | null
+  label: string | null
+  age_secs: number
+}
+
+export interface TabsInfo {
+  tabs: TabInfo[]
+  active: number
+  generation: number
 }
 
 export interface TimelinePoint {

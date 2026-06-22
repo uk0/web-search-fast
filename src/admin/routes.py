@@ -120,6 +120,25 @@ async def get_db_health(request: Request) -> JSONResponse:
     return JSONResponse(health)
 
 
+# --- Live browser tabs (instance/tab/session map) ---
+
+async def get_tabs(request: Request) -> JSONResponse:
+    """Live map of browser-generation + tab-id + request/session, read directly
+    from the running pool (not Redis — these are live objects)."""
+    try:
+        import sys
+        main_mod = sys.modules.get("__main__")
+        pool = getattr(main_mod, "_pool_instance", None) if main_mod else None
+        if pool is None:
+            from src.mcp_server import _pool_instance as pool
+        if pool and hasattr(pool, "tab_details"):
+            return JSONResponse({"tabs": pool.tab_details(), "active": pool._active_tabs,
+                                 "generation": pool._browser_generation})
+    except Exception as exc:
+        logger.warning("[admin] tab details unavailable: %s", exc)
+    return JSONResponse({"tabs": [], "active": 0, "generation": 0})
+
+
 # --- System Info ---
 
 async def get_system(request: Request) -> JSONResponse:
@@ -258,6 +277,7 @@ async def _reload_proxies() -> None:
 admin_routes = [
     Route("/admin/api/stats", get_stats, methods=["GET"]),
     Route("/admin/api/db-health", get_db_health, methods=["GET"]),
+    Route("/admin/api/tabs", get_tabs, methods=["GET"]),
     Route("/admin/api/search-logs", list_search_logs, methods=["GET"]),
     Route("/admin/api/keys", list_keys, methods=["GET"]),
     Route("/admin/api/keys", create_key, methods=["POST"]),

@@ -53,6 +53,11 @@ try:
 except ValueError:
     _RECYCLE_AFTER_REQUESTS = 1000
 
+# Leak reaper: a tab alive longer than this is orphaned (no legit search runs
+# past the 25s budget) — force-close it. Reaper scans on this interval.
+_TAB_MAX_LIFETIME_SECS = 90.0
+_REAPER_INTERVAL_SECS = 20.0
+
 
 class BrowserPool:
     def __init__(
@@ -111,6 +116,13 @@ class BrowserPool:
         self._recycle_count = 0
         self._requests_at_last_start = 0
         self._active_tabs = 0
+        # --- instance/tab/session tracking + leak reaping ---
+        # tab_id -> {tab_id, generation, req_id, session, label, page, started_at}
+        self._tab_registry: dict[int, dict] = {}
+        self._tab_seq = 0
+        self._tab_high_water = 0
+        self._leaked_reaped = 0
+        self._reaper_task: asyncio.Task | None = None
         # --- auto-scaling ---
         self._last_scale_time = 0.0
         self._scale_lock = asyncio.Lock()
@@ -176,6 +188,11 @@ class BrowserPool:
             bool(self._proxy), self._proxy_rotator.count if self._proxy_rotator else 0,
             self._os_target or "auto", self._block_webgl,
         )
+        # On a fresh instance, registry entries from the previous generation
+        # point at dead pages — clear them so the reaper/stats are accurate.
+        self._tab_registry.clear()
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.create_task(self._reap_leaked_tabs())
 
     async def stop(self) -> None:
         if not self._started:
@@ -189,6 +206,7 @@ class BrowserPool:
             await self._proxy_rotator.stop_bridges()
         self._started = False
         self._browser = None
+        self._tab_registry.clear()
         logger.info("[pool] stopped (requests=%d, failures=%d, restarts=%d)",
                      self._total_requests, self._total_failures, self._restart_count)
 
@@ -273,6 +291,8 @@ class BrowserPool:
             "restart_count": self._restart_count,
             "recycle_count": self._recycle_count,
             "generation": self._browser_generation,
+            "tab_high_water": self._tab_high_water,
+            "leaked_reaped": self._leaked_reaped,
             "proxy_count": self._proxy_rotator.count if self._proxy_rotator else 0,
             # Configured fingerprint/perf defaults of the initialized instance
             "block_resources": self._block_resources,
@@ -375,6 +395,58 @@ class BrowserPool:
         except Exception as exc:
             logger.debug("[pool] resource blocker install failed: %s", exc)
 
+    async def _reap_leaked_tabs(self) -> None:
+        """Background leak guard: force-close tabs alive past the max lifetime.
+
+        A legit search exits within the 25s budget and deregisters its tab in
+        acquire()'s finally. Anything still open after _TAB_MAX_LIFETIME_SECS is
+        orphaned (e.g. a cancelled coroutine that didn't unwind, or a wedged
+        page) and would leak memory — close it and free the slot.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_REAPER_INTERVAL_SECS)
+                if self._started:
+                    await self._reap_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("[pool] reaper error: %s", exc)
+
+    async def _reap_once(self) -> int:
+        """One reap pass: close + deregister tabs older than the max lifetime.
+        Returns the number reaped."""
+        now = time.monotonic()
+        stale = [r for r in list(self._tab_registry.values())
+                 if now - r["started_at"] > _TAB_MAX_LIFETIME_SECS]
+        for rec in stale:
+            age = now - rec["started_at"]
+            logger.warning("[pool] reaping leaked tab #%d (req#%s, age=%.0fs, label=%r)",
+                           rec["tab_id"], rec.get("req_id"), age, rec.get("label"))
+            page = rec.get("page")
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            self._tab_registry.pop(rec["tab_id"], None)
+            self._leaked_reaped += 1
+        return len(stale)
+
+    def tab_details(self) -> list[dict]:
+        """Live instance/tab/session map — which browser generation + tab is
+        serving which request/session, and for how long."""
+        now = time.monotonic()
+        rows = [{
+            "tab_id": r["tab_id"],
+            "generation": r["generation"],
+            "req_id": r.get("req_id"),
+            "session": r.get("session"),
+            "label": r.get("label"),
+            "age_secs": round(now - r["started_at"], 1),
+        } for r in list(self._tab_registry.values())]
+        return sorted(rows, key=lambda x: x["tab_id"])
+
     async def _maybe_recycle(self) -> None:
         """Recycle the browser to free accumulated memory — only when idle.
 
@@ -430,11 +502,15 @@ class BrowserPool:
             await self._push_stats()
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncGenerator[Page, None]:
+    async def acquire(self, *, label: str | None = None, session: str | None = None) -> AsyncGenerator[Page, None]:
         """Acquire a browser tab. Auto-scales and auto-restarts if needed.
 
         When proxy rotation is enabled, creates a new browser context with
         a per-request proxy, ensuring each request uses a different proxy.
+
+        ``label``/``session`` are recorded in the live instance/tab registry
+        (browser-generation + tab-id + request/session) for observability and
+        leak detection — see tab_details().
         """
         self._total_requests += 1
         req_id = self._total_requests
@@ -540,6 +616,15 @@ class BrowserPool:
             logger.info("[pool] req#%d — tab opened in %.0fms (semaphore slots: %d/%d)",
                         req_id, open_ms, self._semaphore._value, self._pool_size)
             self._active_tabs += 1
+            # Register in the instance/tab/session map for observability + reaping
+            self._tab_seq += 1
+            tab_id = self._tab_seq
+            self._tab_registry[tab_id] = {
+                "tab_id": tab_id, "generation": self._browser_generation,
+                "req_id": req_id, "session": session, "label": label,
+                "page": page, "started_at": time.monotonic(),
+            }
+            self._tab_high_water = max(self._tab_high_water, len(self._tab_registry))
             await self._push_stats()
             try:
                 yield page
@@ -557,6 +642,7 @@ class BrowserPool:
                     self._proxy_rotator.mark_ok(original_url)
             finally:
                 self._active_tabs -= 1
+                self._tab_registry.pop(tab_id, None)
                 await self._push_stats()
                 try:
                     await page.close()

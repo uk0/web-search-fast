@@ -76,7 +76,7 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
         from src.scraper.proxy import is_proxy_error
 
         engine_chain = [req.engine] + FALLBACK_ORDER.get(req.engine, [])
-        async with pool.acquire() as page:
+        async with pool.acquire(label=f"search:{req.query[:40]}") as page:
             last_exc: Exception | None = None
             best_results: list = []
             best_engine = req.engine
@@ -177,7 +177,7 @@ async def fetch_url_content(pool: BrowserPool, url: str, timeout: int = 30) -> s
     logger.info("[fetch] start: url=%s timeout=%ds", url[:120], timeout)
     for attempt in (1, 2):
         try:
-            async with pool.acquire() as page:
+            async with pool.acquire(label=f"fetch:{url[:48]}") as page:
                 # Single-page reads render JS content + scroll for lazy-load
                 html = await fetch_page_content(page, url, timeout, render=True, scroll=True)
             break
