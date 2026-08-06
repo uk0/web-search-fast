@@ -10,8 +10,9 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-# Paths that skip API key auth (health/pool endpoints only)
-_SKIP_PREFIXES = ("/health", "/pool/")
+# Paths that skip API key auth: health/pool plus the ops probe + metrics
+# surface, which orchestrators (K8s, Prometheus) must scrape without a token.
+_SKIP_PREFIXES = ("/health", "/pool/", "/livez", "/readyz", "/metrics")
 
 # Admin static assets don't need auth (JS/CSS/images)
 _ADMIN_STATIC_PREFIXES = ("/admin/assets/",)

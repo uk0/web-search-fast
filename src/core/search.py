@@ -59,6 +59,27 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
     logger.info("[search] start: query=%r engine=%s depth=%d max_results=%d timeout=%ds",
                 req.query[:80], req.engine.value, req.depth, req.max_results, total_timeout)
 
+    # Cache lookup first — an identical query costs ~3-9s to re-scrape, so a hit
+    # is the single biggest latency win available.
+    from src.core.cache import get_cached, set_cached
+    from src.observability import metrics
+
+    # NB: cache hit/miss counters are published at scrape time from the cache's
+    # own totals (metrics.set_cache_stats) — incrementing here too would double
+    # count, which the metrics module explicitly warns against.
+    cached = await get_cached(req.query, req.engine.value, req.depth, req.max_results)
+    if cached is not None:
+        elapsed = int((time.monotonic() - start) * 1000)
+        logger.info("[search] cache HIT in %dms — query=%r", elapsed, req.query[:60])
+        try:
+            response = SearchResponse.model_validate(cached)
+            # Report this request's own elapsed time, not the cached one.
+            response.metadata.elapsed_ms = elapsed
+            response.metadata.cached = True
+            return response
+        except Exception as exc:  # corrupt/stale payload — fall through to a live search
+            logger.warning("[search] cached payload unusable (%s), re-searching", exc)
+
     # Treat a SERP as "good enough" at half the requested results (min 3).
     # Below this, a sparse/blocked engine (e.g. Google on a shopping-heavy
     # query returning 1 organic link) falls through to the next engine, and
@@ -73,27 +94,58 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
         abort the chain immediately (the page's proxy is dead) and bubble up
         so the caller can retry on a fresh page/proxy.
         """
+        from src.engine import health as eng_health
         from src.scraper.proxy import is_proxy_error
 
-        engine_chain = [req.engine] + FALLBACK_ORDER.get(req.engine, [])
+        # Reorder by live engine health: an engine known to be CAPTCHA-blocked
+        # is skipped outright instead of burning ~2-3s proving it again.
+        ordered = eng_health.order_engines(
+            req.engine.value, [e.value for e in FALLBACK_ORDER.get(req.engine, [])]
+        )
+        engine_chain = [SearchEngine(name) for name in ordered]
         async with pool.acquire(label=f"search:{req.query[:40]}") as page:
             last_exc: Exception | None = None
             best_results: list = []
             best_engine = req.engine
             for eng_key in engine_chain:
+                # Admission gate: order_engines() ranks, should_skip() decides.
+                # It hands out exactly one half-open probe lease, so a recovering
+                # engine gets a single trial request instead of a stampede — but
+                # never skip the last resort, we must try something.
+                if eng_health.should_skip(eng_key.value) and eng_key is not engine_chain[-1]:
+                    logger.info("[search] skipping %s — breaker says unavailable", eng_key.value)
+                    continue
                 engine = ENGINES[eng_key]
+                eng_t0 = time.monotonic()
                 try:
                     results = await engine.search(page, req.query, req.max_results)
                 except Exception as exc:
                     last_exc = exc
                     if is_proxy_error(exc, rotating=True):
+                        # The proxy died, not the engine — don't blame the engine.
                         logger.warning(
                             "[search] engine %s hit proxy error (%s) — abandoning this page",
                             eng_key.value, str(exc)[:100],
                         )
                         raise
+                    eng_health.record_failure(eng_key.value)
+                    metrics.record_search(eng_key.value, "error")
                     logger.warning("[search] engine %s failed: %s", eng_key.value, exc)
                     continue
+                eng_ms = (time.monotonic() - eng_t0) * 1000
+                if results:
+                    eng_health.record_success(eng_key.value, eng_ms)
+                    metrics.record_search(eng_key.value, "success", eng_ms / 1000)
+                else:
+                    # Empty SERP: only a real interstitial (Google /sorry/ or a
+                    # captcha URL) is a hard block worth tripping the breaker
+                    # fast. A merely-empty parse is often transient (selector
+                    # timing on a slow page) and must NOT bench a good engine.
+                    landed = (getattr(page, "url", "") or "").lower()
+                    blocked = "/sorry/" in landed or "captcha" in landed
+                    eng_health.record_failure(eng_key.value, blocked=blocked)
+                    metrics.record_search(eng_key.value, "blocked" if blocked else "error",
+                                          eng_ms / 1000)
                 if len(results) > len(best_results):
                     best_results, best_engine = results, eng_key
                 if len(results) >= sufficient:
@@ -138,7 +190,7 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
         pool.record_success()
         logger.info("[search] complete in %dms — %d results, engine=%s", elapsed, len(results), used_engine.value)
 
-        return SearchResponse(
+        response = SearchResponse(
             query=req.query,
             engine=used_engine,
             depth=req.depth,
@@ -151,11 +203,18 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
                 depth=req.depth,
             ),
         )
+        # Only cache productive answers — caching an empty SERP would pin a
+        # transient block/CAPTCHA in place for the whole TTL.
+        if results:
+            await set_cached(req.query, req.engine.value, req.depth, req.max_results,
+                             response.model_dump(mode="json"))
+        return response
 
     try:
         return await asyncio.wait_for(_inner(), timeout=total_timeout)
     except asyncio.TimeoutError:
         elapsed = int((time.monotonic() - start) * 1000)
+        metrics.record_search(req.engine.value, "timeout", elapsed / 1000)
         pool.record_failure()
         logger.warning("[search] TIMEOUT after %dms (limit=%ds) — pool stats: %s",
                        elapsed, total_timeout, pool.stats)

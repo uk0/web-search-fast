@@ -8,10 +8,11 @@ from src.config import SearchEngine
 from src.core.search import SearchError, do_search
 
 
-def _mock_pool(started: bool = True) -> MagicMock:
+def _mock_pool(started: bool = True, page_url: str = "https://duckduckgo.com/?q=x") -> MagicMock:
     pool = MagicMock()
     pool._started = started
     page = AsyncMock()
+    page.url = page_url  # search.py inspects the landed URL to detect real blocks
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=page)
     pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
     return pool
@@ -133,3 +134,40 @@ class TestFetchUrlContent:
         from src.core.search import fetch_url_content
         result = await fetch_url_content(pool, "https://example.com")
         assert result == ""
+
+
+class TestEngineHealthSignals:
+    """Empty SERPs must only trip the breaker fast on a REAL block page."""
+
+    @pytest.mark.asyncio
+    @patch("src.core.search.crawl_results", new_callable=AsyncMock)
+    @patch("src.core.search.ENGINES")
+    @patch("src.core.search.FALLBACK_ORDER", {SearchEngine.DUCKDUCKGO: []})
+    async def test_transient_empty_serp_does_not_open_breaker(self, mock_engines, mock_crawl):
+        from src.engine import health as eng_health
+        pool = _mock_pool()
+        empty = AsyncMock()
+        empty.search.return_value = []
+        mock_engines.__getitem__ = MagicMock(return_value=empty)
+        mock_crawl.side_effect = lambda pool, r, **kw: r
+
+        req = SearchRequest(query="q", engine=SearchEngine.DUCKDUCKGO, max_results=5)
+        await do_search(pool, req)
+        # one plain failure must not bench the engine (threshold is 3)
+        assert not eng_health.should_skip("duckduckgo")
+
+    @pytest.mark.asyncio
+    @patch("src.core.search.crawl_results", new_callable=AsyncMock)
+    @patch("src.core.search.ENGINES")
+    @patch("src.core.search.FALLBACK_ORDER", {SearchEngine.GOOGLE: []})
+    async def test_captcha_page_opens_breaker_immediately(self, mock_engines, mock_crawl):
+        from src.engine import health as eng_health
+        pool = _mock_pool(page_url="https://www.google.com/sorry/index?continue=x")
+        empty = AsyncMock()
+        empty.search.return_value = []
+        mock_engines.__getitem__ = MagicMock(return_value=empty)
+        mock_crawl.side_effect = lambda pool, r, **kw: r
+
+        req = SearchRequest(query="q", engine=SearchEngine.GOOGLE, max_results=5)
+        await do_search(pool, req)
+        assert eng_health.should_skip("google")  # hard block trips at once

@@ -367,6 +367,10 @@ def main() -> None:
             await init_db(admin_cfg.db_path)
             from src.admin.repository import init_redis
             await init_redis(admin_cfg.redis_url or None)
+            # Shared search cache: Redis makes hits survive restarts and span
+            # replicas; absence silently degrades to the in-process tier.
+            from src.core.cache import close_cache_redis, init_cache_redis
+            await init_cache_redis(admin_cfg.redis_url or None)
             await _ensure_pool()
             logger.info(
                 "%s server starting on %s:%d (admin: %s)",
@@ -378,6 +382,7 @@ def main() -> None:
                     yield state
             finally:
                 await _shutdown_pool()
+                await close_cache_redis()
                 await close_db()
 
         app.router.lifespan_context = _combined_lifespan
@@ -399,6 +404,39 @@ def main() -> None:
 
         app.routes.insert(0, _Route("/health", _health))
         app.routes.insert(0, _Route("/pool/stats", _pool_stats))
+
+        # ---- Enterprise ops surface: metrics + K8s-style probes ----
+        from src.observability import health as health_probes
+        from src.observability import metrics as metrics_mod
+
+        def _refresh_pool_gauges() -> None:
+            """Pull live pool numbers into the gauges at scrape time."""
+            pool = _pool_instance
+            if pool is not None:
+                metrics_mod.set_browser_pool_stats(pool.stats)
+
+        async def _metrics(request):
+            _refresh_pool_gauges()
+            from src.core.cache import cache_stats
+            stats = cache_stats()
+            metrics_mod.set_cache_stats(stats.get("hits", 0), stats.get("misses", 0))
+            return await metrics_mod.metrics_endpoint(request)
+
+        async def _readyz(request):
+            payload = await health_probes.readiness()
+            return _JSONResponse(payload, status_code=health_probes.http_status(payload))
+
+        async def _livez(request):
+            return _JSONResponse(health_probes.liveness())
+
+        async def _healthz_deep(request):
+            payload = await health_probes.deep_health()
+            return _JSONResponse(payload, status_code=health_probes.http_status(payload))
+
+        app.routes.insert(0, _Route("/metrics", _metrics))
+        app.routes.insert(0, _Route("/livez", _livez))
+        app.routes.insert(0, _Route("/readyz", _readyz))
+        app.routes.insert(0, _Route("/health/deep", _healthz_deep))
 
         # ---- Search REST API (GET/POST /search) ----
         from starlette.responses import PlainTextResponse as _PlainTextResponse
@@ -509,7 +547,15 @@ def main() -> None:
             app.routes.insert(-1, Route("/admin/{path:path}", spa_fallback))
             app.routes.insert(-1, Route("/admin", spa_fallback))
 
-        # Middleware stack (last added = outermost = runs first)
+        # Middleware stack (last added = outermost = runs first).
+        # Rate limiting sits INSIDE auth so limits key off the authenticated
+        # API key id (set by APIKeyAuthMiddleware) rather than a spoofable IP.
+        from src.middleware.rate_limit import RateLimitMiddleware
+        from src.observability.metrics import RequestIDMiddleware
+        app.add_middleware(RateLimitMiddleware)
+        # Outermost: every response (including 429s and errors) carries a
+        # correlation id, and an inbound X-Request-ID is honoured end-to-end.
+        app.add_middleware(RequestIDMiddleware)
         app.add_middleware(IPBanMiddleware)
         app.add_middleware(APIKeyAuthMiddleware)
         app.add_middleware(SearchLogMiddleware)

@@ -35,6 +35,7 @@ class SearchMetadata(BaseModel):
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     engine: SearchEngine = SearchEngine.GOOGLE
     depth: int = 1
+    cached: bool = False
 
 
 class SearchResponse(BaseModel):

@@ -120,6 +120,31 @@ async def get_db_health(request: Request) -> JSONResponse:
     return JSONResponse(health)
 
 
+# --- Performance surface: cache / engine health / rate limiting ---
+
+async def get_perf(request: Request) -> JSONResponse:
+    """Everything the dashboard needs to judge search performance at a glance."""
+    from src.core.cache import cache_stats
+    from src.engine.health import engine_health_stats
+    from src.middleware.rate_limit import rate_limit_stats
+
+    payload: dict = {}
+    for name, fn in (("cache", cache_stats), ("engines", engine_health_stats),
+                     ("rate_limit", rate_limit_stats)):
+        try:
+            payload[name] = fn()
+        except Exception as exc:  # a broken stat must not take the panel down
+            logger.warning("[admin] %s stats unavailable: %s", name, exc)
+            payload[name] = {"error": str(exc)}
+    return JSONResponse(payload)
+
+
+async def clear_search_cache(request: Request) -> JSONResponse:
+    from src.core.cache import clear_cache
+    removed = await clear_cache()
+    return JSONResponse({"ok": True, "cleared": removed})
+
+
 # --- Live browser tabs (instance/tab/session map) ---
 
 async def get_tabs(request: Request) -> JSONResponse:
@@ -278,6 +303,8 @@ admin_routes = [
     Route("/admin/api/stats", get_stats, methods=["GET"]),
     Route("/admin/api/db-health", get_db_health, methods=["GET"]),
     Route("/admin/api/tabs", get_tabs, methods=["GET"]),
+    Route("/admin/api/perf", get_perf, methods=["GET"]),
+    Route("/admin/api/cache", clear_search_cache, methods=["DELETE"]),
     Route("/admin/api/search-logs", list_search_logs, methods=["GET"]),
     Route("/admin/api/keys", list_keys, methods=["GET"]),
     Route("/admin/api/keys", create_key, methods=["POST"]),
