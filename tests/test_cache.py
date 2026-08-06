@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import sys
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Coroutine
 
 import pytest
 
@@ -15,10 +16,12 @@ from src.core import cache
 def _clean_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate every test: empty tiers, zeroed counters, no cache env vars."""
     cache._MEM.clear()
+    cache._INFLIGHT.clear()
     for key in cache._stats:
         cache._stats[key] = 0
     monkeypatch.setattr(cache, "_redis", None)
-    for var in ("SEARCH_CACHE_ENABLED", "SEARCH_CACHE_TTL", "SEARCH_CACHE_MAX", "SEARCH_CACHE_REDIS_URL"):
+    for var in ("SEARCH_CACHE_ENABLED", "SEARCH_CACHE_TTL", "SEARCH_CACHE_MAX",
+                "SEARCH_CACHE_REDIS_URL", "SEARCH_CACHE_INFLIGHT_WAIT"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -279,3 +282,297 @@ class TestRedisTier:
         assert await cache.init_cache_redis() is False
         await cache.close_cache_redis()
         assert cache.cache_stats()["backend"] == "memory"
+
+
+class TestSingleFlight:
+    """get_or_compute: N concurrent identical cold queries must cost ONE compute."""
+
+    @pytest.mark.asyncio
+    async def test_burst_coalesces_to_single_compute(self) -> None:
+        payload = _payload()
+        calls = 0
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return payload
+
+        tasks = [asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute)) for _ in range(8)]
+        await entered.wait()  # leader is inside compute; FIFO scheduling has attached the other 7
+        assert cache._stats["coalesced"] == 7
+        assert cache.cache_stats()["inflight"] == 1 and calls == 1
+
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+
+        assert calls == 1
+        assert all(r == payload for r in results)
+        # Isolation: mutating one caller's copy must leak into no other caller
+        # and never into the cache (results[1] is a follower's copy).
+        assert results[1] is not None and results[2] is not None
+        results[1]["total"] = 999
+        assert results[2]["total"] == 1 and payload["total"] == 1
+        hit = await cache.get_cached("q", "google", 1, 10)
+        assert hit is not None and hit["total"] == 1
+
+        assert cache._INFLIGHT == {} and cache.cache_stats()["inflight"] == 0  # no leaked slot
+        # Result was cached: a late identical caller never invokes compute.
+        assert await cache.get_or_compute("q", "google", 1, 10, compute) == payload
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_different_keys_are_not_coalesced(self) -> None:
+        entered_a, entered_b, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls = {"a": 0, "b": 0}
+
+        def gated(name: str, entered: asyncio.Event) -> Callable[[], Coroutine[Any, Any, dict[str, Any]]]:
+            async def compute() -> dict[str, Any]:
+                calls[name] += 1
+                entered.set()
+                await release.wait()
+                return _payload(name)
+            return compute
+
+        task_a = asyncio.create_task(cache.get_or_compute("qa", "google", 1, 10, gated("a", entered_a)))
+        task_b = asyncio.create_task(cache.get_or_compute("qb", "google", 1, 10, gated("b", entered_b)))
+        # Both computes run CONCURRENTLY — proof the two keys never shared a slot.
+        await asyncio.wait_for(asyncio.gather(entered_a.wait(), entered_b.wait()), timeout=2)
+        assert cache.cache_stats()["inflight"] == 2
+
+        release.set()
+        result_a, result_b = await asyncio.gather(task_a, task_b)
+
+        assert calls == {"a": 1, "b": 1} and cache._stats["coalesced"] == 0
+        assert result_a is not None and result_a["query"] == "a"
+        assert result_b is not None and result_b["query"] == "b"
+        assert cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_leader_exception_propagates_to_every_follower(self) -> None:
+        calls = 0
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            raise RuntimeError("scrape blew up")
+
+        tasks = [asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute)) for _ in range(4)]
+        await entered.wait()
+        assert cache._stats["coalesced"] == 3
+
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+
+        assert calls == 1  # one compute — the failure fanned out, no retries piled on
+        assert all(isinstance(r, RuntimeError) and str(r) == "scrape blew up" for r in results)
+        assert cache._INFLIGHT == {}  # registry freed on failure — key is not wedged
+        assert await cache.get_cached("q", "google", 1, 10) is None  # failures are never cached
+        with pytest.raises(RuntimeError):  # next caller gets a fresh compute
+            await cache.get_or_compute("q", "google", 1, 10, compute)
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_leader_cancellation_reelects_instead_of_hanging_followers(self) -> None:
+        payload = _payload()
+        calls = 0
+        entered = asyncio.Event()
+        stall = asyncio.Event()  # never set: the first leader hangs until cancelled
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await stall.wait()
+            return payload
+
+        leader = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        followers = [asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute)) for _ in range(3)]
+        await entered.wait()
+        assert cache._stats["coalesced"] == 3
+
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        # Followers must not hang: one re-elects and computes, the rest are served.
+        results = await asyncio.wait_for(asyncio.gather(*followers), timeout=2)
+
+        assert all(r == payload for r in results)
+        assert calls == 2  # original + exactly one re-elected leader
+        assert cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_follower_cancellation_leaves_leader_and_others_intact(self) -> None:
+        payload = _payload()
+        calls = 0
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return payload
+
+        leader = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        keeper = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        dropped = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        await entered.wait()
+        assert cache._stats["coalesced"] == 2
+
+        dropped.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dropped
+        assert cache.cache_stats()["inflight"] == 1  # shared future survived the follower's cancel
+
+        release.set()
+        assert await leader == payload
+        assert await keeper == payload
+        assert calls == 1 and cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_follower_cancelled_with_the_leader_stays_cancelled(self) -> None:
+        """Both cancelled in one tick: the follower must die, not re-elect itself.
+
+        Re-electing here would resurrect a task its caller already abandoned
+        (client hangup / shutdown) and start a second scrape nobody consumes.
+        """
+        calls = 0
+        entered = asyncio.Event()
+        stall = asyncio.Event()  # never set
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await stall.wait()
+            return _payload()
+
+        leader = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        follower = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        await entered.wait()
+        assert calls == 1
+
+        follower.cancel()
+        leader.cancel()
+        for task in (leader, follower):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+
+        assert follower.cancelled()
+        assert calls == 1  # the abandoned follower must NOT have started a new compute
+        assert cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_none_result_releases_followers_and_is_not_cached(self) -> None:
+        calls = 0
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def compute() -> dict[str, Any] | None:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return None
+
+        tasks = [asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute)) for _ in range(4)]
+        await entered.wait()
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+
+        assert results == [None, None, None, None]  # every waiter released
+        assert calls == 1
+        assert cache._MEM == {} and cache.cache_stats()["sets"] == 0  # empty SERPs never cached
+        assert cache._INFLIGHT == {}
+        # Nothing cached ⇒ the next call elects a fresh leader.
+        assert await cache.get_or_compute("q", "google", 1, 10, compute) is None
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_follower_wait_is_bounded_by_explicit_timeout(self) -> None:
+        entered = asyncio.Event()
+        stall = asyncio.Event()  # never set: leader out-lives the follower's bound
+
+        async def compute() -> dict[str, Any]:
+            entered.set()
+            await stall.wait()
+            return _payload()
+
+        leader = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        await entered.wait()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await cache.get_or_compute("q", "google", 1, 10, compute, wait_timeout=0.05)
+        # The bound freed only the follower — leader and shared future still run.
+        assert cache.cache_stats()["inflight"] == 1 and not leader.done()
+
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        assert cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_follower_wait_bound_defaults_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SEARCH_CACHE_INFLIGHT_WAIT", "0.05")
+        entered = asyncio.Event()
+        stall = asyncio.Event()  # never set
+
+        async def compute() -> dict[str, Any]:
+            entered.set()
+            await stall.wait()
+            return _payload()
+
+        leader = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        await entered.wait()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await cache.get_or_compute("q", "google", 1, 10, compute)  # no explicit bound — env applies
+
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        assert cache._INFLIGHT == {}
+
+    @pytest.mark.asyncio
+    async def test_disabled_cache_disables_coalescing_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SEARCH_CACHE_ENABLED", "0")
+        release = asyncio.Event()
+        entered = [asyncio.Event(), asyncio.Event()]
+        calls = 0
+
+        async def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            entered[calls - 1].set()
+            await release.wait()
+            return _payload()
+
+        task_1 = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        task_2 = asyncio.create_task(cache.get_or_compute("q", "google", 1, 10, compute))
+        # Disabled means fresh work per caller: BOTH computes run concurrently.
+        await asyncio.wait_for(asyncio.gather(entered[0].wait(), entered[1].wait()), timeout=2)
+        assert calls == 2 and cache.cache_stats()["inflight"] == 0
+
+        release.set()
+        await asyncio.gather(task_1, task_2)
+        assert cache._MEM == {} and cache._stats["coalesced"] == 0
+
+    @pytest.mark.asyncio
+    async def test_warm_key_never_calls_compute(self) -> None:
+        payload = _payload()
+        await cache.set_cached("q", "google", 1, 10, payload)
+
+        async def compute() -> dict[str, Any]:
+            raise AssertionError("compute must not run on a warm key")
+
+        assert await cache.get_or_compute("q", "google", 1, 10, compute) == payload
+
+    def test_stats_expose_inflight_and_coalesced(self) -> None:
+        stats = cache.cache_stats()
+        assert stats["inflight"] == 0 and stats["coalesced"] == 0

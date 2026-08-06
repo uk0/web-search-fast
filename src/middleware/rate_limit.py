@@ -13,6 +13,13 @@ Environment:
     RATE_LIMIT_MONTHLY      requests per 30d        (default 0 = unlimited)
     RATE_LIMIT_IDLE_TTL     idle bucket ttl in s    (default 300)
     RATE_LIMIT_MAX_BUCKETS  hard bucket cap         (default 10000)
+
+Env parsing never stops boot: unparseable or non-finite (NaN/inf) values warn and
+fall back to the default; finite but out-of-range values warn and are clamped.
+
+Billing rule: daily/monthly quotas charge only requests that complete without a
+server error (2xx/3xx/4xx). 5xx responses and unhandled exceptions are not billed.
+Rate-limit tokens are different — they are spent at admission regardless of outcome.
 """
 from __future__ import annotations
 
@@ -40,13 +47,19 @@ _MONTH = 30.0 * _DAY
 # the limiter itself into the DoS vector it exists to prevent.
 _REAP_INTERVAL = 60.0
 
-# /health and /pool/ mirror the auth middleware's skip list. The whole admin panel is
+# /health and /pool mirror the auth middleware's skip list. The whole admin panel is
 # exempt on purpose: /admin/api/* already requires ADMIN_TOKEN and the dashboard polls
 # on a timer, so throttling the operator's own console mid-incident costs more than it saves.
 # /livez, /readyz and /metrics are unauthenticated, so behind a proxy they share the one
 # IP bucket every other anonymous caller lands in — a 429 there restarts the pod or blinds
 # the scrape, which is strictly worse than the load the probes themselves add.
-_EXEMPT_PREFIXES = ("/health", "/pool/", "/admin", "/livez", "/readyz", "/metrics")
+_EXEMPT_PREFIXES = ("/health", "/pool", "/admin", "/livez", "/readyz", "/metrics")
+
+
+def _is_exempt(path: str) -> bool:
+    # Boundary-safe: "/health" exempts "/health" and "/health/deep" but never a
+    # lookalike such as "/healthz-evil" — bare startswith would hand those a bypass.
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _EXEMPT_PREFIXES)
 
 _REASON_MESSAGES = {
     "rate": "Rate limit exceeded",
@@ -58,22 +71,34 @@ _REASON_MESSAGES = {
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
         return True
+    logger.warning("[rate_limit] invalid %s=%r — using %s", name, raw, default)
     return default
 
 
-def _env_num(name: str, default: float) -> float:
+def _env_num(name: str, default: float, lo: float, hi: float) -> float:
+    """Parse a numeric env var. Garbage or NaN/inf warn and fall back; finite values clamp to [lo, hi]."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("[rate_limit] invalid %s=%r — using %s", name, raw, default)
         return default
+    if not math.isfinite(value):
+        logger.warning("[rate_limit] non-finite %s=%r — using %s", name, raw, default)
+        return default
+    if value < lo or value > hi:
+        clamped = min(max(value, lo), hi)
+        logger.warning("[rate_limit] out-of-range %s=%r — clamped to %s", name, raw, clamped)
+        return clamped
+    return value
 
 
 @dataclass(frozen=True)
@@ -100,15 +125,16 @@ class RateLimitConfig:
 
     @classmethod
     def from_env(cls) -> RateLimitConfig:
+        """Build from RATE_LIMIT_* env vars. Every value is sanitized — bad input warns, never crashes boot."""
         return cls(
             enabled=_env_bool("RATE_LIMIT_ENABLED", True),
-            rps=_env_num("RATE_LIMIT_RPS", 5.0),
-            burst=int(_env_num("RATE_LIMIT_BURST", 10)),
-            concurrency=int(_env_num("RATE_LIMIT_CONCURRENCY", 4)),
-            daily_quota=int(_env_num("RATE_LIMIT_DAILY", 0)),
-            monthly_quota=int(_env_num("RATE_LIMIT_MONTHLY", 0)),
-            idle_ttl=_env_num("RATE_LIMIT_IDLE_TTL", 300.0),
-            max_buckets=int(_env_num("RATE_LIMIT_MAX_BUCKETS", 10_000)),
+            rps=_env_num("RATE_LIMIT_RPS", 5.0, 0.01, 10_000.0),
+            burst=int(_env_num("RATE_LIMIT_BURST", 10, 1, 1_000_000)),
+            concurrency=int(_env_num("RATE_LIMIT_CONCURRENCY", 4, 1, 10_000)),
+            daily_quota=int(_env_num("RATE_LIMIT_DAILY", 0, 0, 1e12)),
+            monthly_quota=int(_env_num("RATE_LIMIT_MONTHLY", 0, 0, 1e12)),
+            idle_ttl=_env_num("RATE_LIMIT_IDLE_TTL", 300.0, 1.0, 7 * _DAY),
+            max_buckets=int(_env_num("RATE_LIMIT_MAX_BUCKETS", 10_000, 1, 1_000_000)),
         )
 
 
@@ -236,8 +262,10 @@ class _Limiter:
             (cfg.monthly_quota, bucket.month_count, bucket.month_start, _MONTH),
         )
         for quota, count, start, window in windows:
-            if quota and quota - count < remaining:
-                limit, remaining = quota, quota - count
+            # count excludes this request (quota is billed post-response), so presume
+            # the charge here to keep the advertised remaining consistent.
+            if quota and quota - count - 1 < remaining:
+                limit, remaining = quota, quota - count - 1
                 reset = _ceil(start + window - now)
         return _Verdict(True, limit, remaining, reset)
 
@@ -276,9 +304,25 @@ class _Limiter:
 
             bucket.inflight += 1
             bucket.allowed += 1
+            # Quota is NOT charged here — the middleware calls commit_quota() once the
+            # response status is known, so server errors never consume billed quota.
+            return self._allow_verdict(bucket, now)
+
+    def commit_quota(self, key: str) -> None:
+        """Charge one request against the daily/monthly windows.
+
+        Called post-response for billable outcomes only (2xx/3xx/4xx). Because the
+        quota check in acquire() cannot see requests still in flight, a caller can
+        overshoot a quota by at most `concurrency` requests — the accepted cost of
+        not billing failures.
+        """
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:  # reset/evicted mid-flight — nothing left to bill
+                return
+            self._roll_windows(bucket, self.clock())
             bucket.day_count += 1
             bucket.month_count += 1
-            return self._allow_verdict(bucket, now)
 
     def release(self, key: str) -> None:
         with self._lock:
@@ -373,6 +417,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     Keyed by `request.state.api_key_id` and falling back to the client IP for open
     deployments, so this MUST be installed *inside* APIKeyAuthMiddleware (added to the
     app before it) or every caller collapses onto one shared IP bucket.
+
+    Quota billing: daily/monthly quotas are billing-shaped, so they charge only
+    requests that complete without a server error — 2xx/3xx/4xx consume quota, while
+    5xx responses and unhandled exceptions do not. Rate-limit tokens are spent at
+    admission for every accepted request regardless of outcome.
     """
 
     def __init__(
@@ -391,7 +440,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if not _limiter.config.enabled or request.url.path.startswith(_EXEMPT_PREFIXES):
+        if not _limiter.config.enabled or _is_exempt(request.url.path):
             return await call_next(request)
 
         key = _client_key(request)
@@ -415,8 +464,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except BaseException:
+            # Slot returned, quota untouched — an unhandled exception surfaces as a 5xx.
             release()
             raise
+
+        # Billable outcome (anything below 5xx): charge the daily/monthly quota now.
+        # Runs before release(), so inflight>0 still pins the bucket against eviction.
+        if response.status_code < 500:
+            _limiter.commit_quota(key)
 
         response.headers.update(_headers(verdict))
         body_iterator = getattr(response, "body_iterator", None)

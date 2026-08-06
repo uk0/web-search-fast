@@ -8,9 +8,16 @@ path degrades to memory-only instead of raising.
 Values are the JSON-serialized ``SearchResponse.model_dump()``. Storing the
 serialized form in both tiers keeps them symmetric and hands every caller a
 fresh object, so a mutated result can never poison the cache.
+
+``get_or_compute`` adds single-flight coalescing on top: a burst of identical
+cold queries (the same LLM-client pattern) elects one leader to scrape while
+every concurrent duplicate waits for that one result instead of burning its
+own browser tab.
 """
 from __future__ import annotations
 
+import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -18,6 +25,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,6 +36,7 @@ KEY_PREFIX = "wsm:search:v1:"
 
 DEFAULT_TTL = 300
 DEFAULT_MAX = 512
+DEFAULT_INFLIGHT_WAIT = 30.0  # backstop only — callers' own timeouts fire first
 
 _WS_RE = re.compile(r"\s+")
 
@@ -35,6 +44,11 @@ _WS_RE = re.compile(r"\s+")
 # No lock: every mutation runs on the event loop between awaits, and a module
 # global (rather than a loop-bound primitive) survives loop teardown in tests.
 _MEM: OrderedDict[str, tuple[float, str]] = OrderedDict()
+
+# Single-flight registry: key -> future carrying the leader's payload. Each
+# entry is owned by exactly one leader and removed in its `finally`, so the
+# registry can never leak an entry past that leader's lifetime.
+_INFLIGHT: dict[str, asyncio.Future[dict[str, Any] | None]] = {}
 
 _redis: Any = None
 
@@ -46,6 +60,7 @@ _stats: dict[str, int] = {
     "evictions": 0,
     "expired": 0,
     "errors": 0,
+    "coalesced": 0,
 }
 
 
@@ -61,6 +76,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 def cache_enabled() -> bool:
     """Whether caching is active. Read per call so env flips take effect live."""
     return os.environ.get("SEARCH_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -72,6 +94,10 @@ def _ttl() -> int:
 
 def _maxsize() -> int:
     return max(1, _env_int("SEARCH_CACHE_MAX", DEFAULT_MAX))
+
+
+def _inflight_wait() -> float:
+    return _env_float("SEARCH_CACHE_INFLIGHT_WAIT", DEFAULT_INFLIGHT_WAIT)
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +324,96 @@ async def set_cached(
     await _redis_set(key, raw, effective_ttl)
 
 
+async def get_or_compute(
+    query: str,
+    engine: str,
+    depth: int,
+    max_results: int,
+    compute: Callable[[], Awaitable[dict[str, Any] | None]],
+    ttl: int | None = None,
+    wait_timeout: float | None = None,
+) -> dict[str, Any] | None:
+    """Cached read with single-flight coalescing: N concurrent identical cold
+    queries cost ONE ``compute()`` (one scrape, one browser tab), not N.
+
+    Returns the cached payload when present. On a cold key exactly one caller
+    (the leader) awaits ``compute()``; every concurrent caller for the same key
+    (a follower) waits for that result. Leader and cache hand out independent
+    copies, so no two callers ever alias the same object.
+
+    Failure semantics:
+    - ``compute()`` returns a payload -> stored via :func:`set_cached`, every
+      waiter receives it.
+    - ``compute()`` returns None (empty SERP rule) -> NOT cached, but every
+      follower is still released with None.
+    - ``compute()`` raises -> the same exception is raised in every waiter and
+      the in-flight slot is freed.
+    - leader cancelled -> followers wake and re-elect a new leader instead of
+      hanging; the slot is freed by the dying leader first.
+    - follower wait is bounded by ``wait_timeout`` (default: env
+      SEARCH_CACHE_INFLIGHT_WAIT, 30s; <= 0 disables the bound); on expiry the
+      follower gets TimeoutError while the leader keeps running.
+
+    Caching disabled turns the whole feature off: each caller just awaits its
+    own ``compute()`` — "no cache" must mean fresh work, not shared results.
+    """
+    if not cache_enabled():
+        return await compute()
+    key = make_key(query, engine, depth, max_results)
+    bound: float | None = _inflight_wait() if wait_timeout is None else wait_timeout
+    if bound is not None and bound <= 0:
+        bound = None
+
+    while True:
+        cached = await get_cached(query, engine, depth, max_results)
+        if cached is not None:
+            return cached
+
+        leader_fut = _INFLIGHT.get(key)
+        if leader_fut is not None:
+            # Follower: piggyback on the in-flight compute. asyncio.wait never
+            # cancels what it waits on, so neither this waiter's timeout nor its
+            # own cancellation can touch the shared future. It also keeps the
+            # two cancellations distinguishable: a dead LEADER arrives as a
+            # completed-cancelled future, while THIS task being cancelled is the
+            # only thing that can raise CancelledError here — so an abandoned
+            # follower can never mistake itself for a survivor and re-elect.
+            _stats["coalesced"] += 1
+            await asyncio.wait({leader_fut}, timeout=bound)
+            if not leader_fut.done():
+                raise asyncio.TimeoutError()  # leader keeps running for the others
+            if leader_fut.cancelled():
+                continue  # leader died mid-flight — re-check cache, re-elect
+            payload = leader_fut.result()  # re-raises the leader's exception
+            return copy.deepcopy(payload) if payload is not None else None
+
+        # Leader: claim the slot (no await between check and claim — atomic on
+        # the event loop), run the expensive work, fan the result out.
+        fut: asyncio.Future[dict[str, Any] | None] = asyncio.get_running_loop().create_future()
+        _INFLIGHT[key] = fut
+        try:
+            try:
+                payload = await compute()
+            except asyncio.CancelledError:
+                fut.cancel()  # wakes followers; they re-elect
+                raise
+            except BaseException as exc:
+                fut.set_exception(exc)
+                fut.exception()  # mark retrieved: a followerless failure must not warn at GC
+                raise
+            # Resolve BEFORE any further await: nothing can sit between
+            # compute() returning and followers being released. The future
+            # carries its own deep copy so the leader's caller can mutate its
+            # return value without poisoning the followers.
+            fut.set_result(None if payload is None else copy.deepcopy(payload))
+        finally:
+            if _INFLIGHT.get(key) is fut:  # always freed: success, error, cancel
+                del _INFLIGHT[key]
+        if payload is not None:  # empty results are never cached (transient blocks)
+            await set_cached(query, engine, depth, max_results, payload, ttl=ttl)
+        return payload
+
+
 async def invalidate(query: str, engine: str, depth: int, max_results: int) -> bool:
     """Drop one entry from both tiers. True when something was removed."""
     key = make_key(query, engine, depth, max_results)
@@ -339,4 +455,6 @@ def cache_stats() -> dict[str, Any]:
         "evictions": _stats["evictions"],
         "expired": _stats["expired"],
         "errors": _stats["errors"],
+        "inflight": len(_INFLIGHT),
+        "coalesced": _stats["coalesced"],
     }

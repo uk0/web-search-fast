@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -59,10 +60,16 @@ def _build_app(
     app = Starlette(routes=[
         Route("/mcp", handler, methods=["GET", "POST"]),
         Route("/health", _ok),
+        Route("/health/deep", _ok),
+        Route("/pool/stats", _ok),
+        Route("/admin", _ok),
         Route("/admin/api/stats", _ok),
         Route("/livez", _ok),
         Route("/readyz", _ok),
         Route("/metrics", _ok),
+        # Lookalikes of exempt paths — MUST be rate limited like any other route.
+        Route("/healthz-evil", _ok),
+        Route("/admin-backdoor", _ok),
     ])
     app.add_middleware(RateLimitMiddleware, config=config, clock=clock)
     app.add_middleware(_KeyIdMiddleware)  # outermost — sets api_key_id first
@@ -146,6 +153,30 @@ def test_health_admin_and_probes_are_exempt():
     assert stats["throttled_total"] == 0
 
 
+def test_lookalike_paths_are_not_exempt():
+    # Regression: bare startswith let "/healthz-evil" / "/admin-backdoor" bypass the
+    # limiter entirely (verified [200, 200, 200] under burst before the boundary fix).
+    client = _client(config=RateLimitConfig(rps=1, burst=2), clock=_FakeClock())
+    assert client.get("/healthz-evil").status_code == 200
+    assert client.get("/admin-backdoor").status_code == 200
+    assert client.get("/healthz-evil").status_code == 429  # shared IP bucket exhausted
+
+    stats = rate_limit_stats()
+    assert stats["active_buckets"] == 1
+    assert stats["throttled_total"] == 1
+
+
+def test_nested_exempt_paths_still_exempt():
+    # Boundary matching must keep the genuine exempt set: exact paths AND subpaths.
+    client = _client(config=RateLimitConfig(rps=1, burst=1), clock=_FakeClock())
+    for _ in range(5):
+        for path in ("/health/deep", "/pool/stats", "/admin", "/admin/api/stats"):
+            assert client.get(path).status_code == 200, path
+    stats = rate_limit_stats()
+    assert stats["active_buckets"] == 0
+    assert stats["throttled_total"] == 0
+
+
 def test_disabled_by_env_passes_through():
     with patch.dict(os.environ, {"RATE_LIMIT_ENABLED": "0", "RATE_LIMIT_BURST": "1"}):
         client = _client(clock=_FakeClock())  # config=None → read from env
@@ -163,6 +194,54 @@ def test_env_defaults_applied():
     assert (stats["enabled"], stats["rps"], stats["burst"], stats["concurrency"]) == (True, 5.0, 10, 4)
 
 
+def test_pathological_env_values_never_crash_boot(caplog):
+    # Regression: RATE_LIMIT_MAX_BUCKETS=inf raised OverflowError inside from_env()
+    # and RATE_LIMIT_RPS=nan exploded later in math.ceil(). Both must warn + default.
+    env = {
+        "RATE_LIMIT_MAX_BUCKETS": "inf",
+        "RATE_LIMIT_RPS": "nan",
+        "RATE_LIMIT_BURST": "-inf",
+        "RATE_LIMIT_DAILY": "1e999",  # float() parses this to inf without raising
+    }
+    with patch.dict(os.environ, env), caplog.at_level(logging.WARNING, logger="src.middleware.rate_limit"):
+        cfg = RateLimitConfig.from_env()  # crashed here before the fix
+        client = _client(clock=_FakeClock())  # config=None → middleware boots from env
+        assert client.get("/mcp").status_code == 200
+    assert (cfg.rps, cfg.burst, cfg.daily_quota, cfg.max_buckets) == (5.0, 10, 0, 10_000)
+    for name in env:
+        assert name in caplog.text  # every bad var is called out
+
+
+def test_out_of_range_env_values_are_clamped(caplog):
+    with (
+        patch.dict(os.environ, {"RATE_LIMIT_RPS": "-5", "RATE_LIMIT_MAX_BUCKETS": "999999999999"}),
+        caplog.at_level(logging.WARNING, logger="src.middleware.rate_limit"),
+    ):
+        cfg = RateLimitConfig.from_env()
+    assert cfg.rps == 0.01
+    assert cfg.max_buckets == 1_000_000
+    assert "RATE_LIMIT_RPS" in caplog.text
+    assert "RATE_LIMIT_MAX_BUCKETS" in caplog.text
+
+
+def test_env_bool_garbage_warns_and_defaults(caplog):
+    # Regression: _env_bool used to swallow unparseable values silently.
+    with (
+        patch.dict(os.environ, {"RATE_LIMIT_ENABLED": "banana"}),
+        caplog.at_level(logging.WARNING, logger="src.middleware.rate_limit"),
+    ):
+        assert RateLimitConfig.from_env().enabled is True
+    assert "RATE_LIMIT_ENABLED" in caplog.text
+
+    caplog.clear()
+    with (
+        patch.dict(os.environ, {"RATE_LIMIT_ENABLED": ""}),
+        caplog.at_level(logging.WARNING, logger="src.middleware.rate_limit"),
+    ):
+        assert RateLimitConfig.from_env().enabled is True
+    assert "RATE_LIMIT_ENABLED" not in caplog.text  # unset/empty is not garbage
+
+
 def test_daily_quota_exceeded():
     client = _client(config=RateLimitConfig(rps=100, burst=100, daily_quota=2), clock=_FakeClock())
     assert client.get("/mcp").status_code == 200
@@ -175,6 +254,58 @@ def test_daily_quota_exceeded():
     assert resp.status_code == 429
     assert resp.json()["reason"] == "daily"
     assert resp.headers["Retry-After"] == "86400"
+
+
+def test_quota_not_consumed_on_unhandled_exception():
+    # Regression: two requests whose handler raised (HTTP 500) left day_count=2.
+    # Billing rule: 5xx / unhandled exceptions never consume daily/monthly quota.
+    async def boom(request: Request) -> Response:
+        raise ValueError("handler exploded")
+
+    client = _client(
+        config=RateLimitConfig(rps=100, burst=100, daily_quota=2),
+        clock=_FakeClock(),
+        handler=boom,
+        raise_server_exceptions=False,
+    )
+    # Before the fix the third request would have been 429 "daily".
+    assert [client.get("/mcp").status_code for _ in range(3)] == [500, 500, 500]
+    row = rate_limit_stats()["keys"][0]
+    assert (row["day_count"], row["month_count"]) == (0, 0)
+    assert row["inflight"] == 0  # slot released on every exception
+
+
+def test_quota_not_consumed_on_5xx_response():
+    async def bad_gateway(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("upstream broke", status_code=502)
+
+    client = _client(
+        config=RateLimitConfig(rps=100, burst=100, daily_quota=1),
+        clock=_FakeClock(),
+        handler=bad_gateway,
+    )
+    assert [client.get("/mcp").status_code for _ in range(3)] == [502, 502, 502]
+    row = rate_limit_stats()["keys"][0]
+    assert (row["day_count"], row["month_count"]) == (0, 0)
+
+
+def test_quota_consumed_on_4xx():
+    # Client errors are real, billable work — only server-side failures are free.
+    async def not_found(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("nope", status_code=404)
+
+    client = _client(
+        config=RateLimitConfig(rps=100, burst=100, daily_quota=2),
+        clock=_FakeClock(),
+        handler=not_found,
+    )
+    assert client.get("/mcp").status_code == 404
+    assert client.get("/mcp").status_code == 404
+
+    resp = client.get("/mcp")
+    assert resp.status_code == 429
+    assert resp.json()["reason"] == "daily"
+    assert rate_limit_stats()["keys"][0]["day_count"] == 2
 
 
 def test_inflight_released_when_handler_raises():

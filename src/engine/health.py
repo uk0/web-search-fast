@@ -11,6 +11,7 @@ injectable (``set_clock``) so tests never sleep.
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -73,10 +74,21 @@ def _key(engine: str) -> str:
 
 
 def _state(name: str) -> _EngineHealth:
+    """Write-path accessor: creates the entry on first use (record_*)."""
     st = _STATES.get(name)
     if st is None:
         st = _STATES[name] = _EngineHealth()
     return st
+
+
+def _snapshot(name: str) -> _EngineHealth:
+    """Read-path accessor: unknown names get a throwaway default.
+
+    Never inserts — read-only callers (order_engines, engine_health_stats)
+    must not grow the global state map for arbitrary names they are shown.
+    """
+    st = _STATES.get(name)
+    return st if st is not None else _EngineHealth()
 
 
 def _derive(st: _EngineHealth, now: float) -> BreakerState:
@@ -174,7 +186,9 @@ def should_skip(engine: str) -> bool:
     """
     with _LOCK:
         now = _clock()
-        st = _state(_key(engine))
+        st = _STATES.get(_key(engine))
+        if st is None:
+            return False  # never recorded -> closed; inspection must not create state
         state = _derive(st, now)
         if state == "closed":
             return False
@@ -207,11 +221,13 @@ def order_engines(preferred: EngineT, fallbacks: Sequence[EngineT]) -> list[Engi
 
     with _LOCK:
         now = _clock()
-        states = {name: _derive(_state(name), now) for name in index}
+        # Read-only ranking: snapshots never insert into the global map.
+        snaps = {name: _snapshot(name) for name in index}
+        states = {name: _derive(snaps[name], now) for name in index}
 
         def healthy_key(engine: EngineT) -> tuple[int, float, float, int]:
             name = _key(engine)
-            st = _state(name)
+            st = snaps[name]
             rate = _success_rate(st)
             return (
                 0 if states[name] == "closed" else 1,
@@ -222,7 +238,7 @@ def order_engines(preferred: EngineT, fallbacks: Sequence[EngineT]) -> list[Engi
 
         def recovery_key(engine: EngineT) -> tuple[float, float, float, int]:
             name = _key(engine)
-            st = _state(name)
+            st = snaps[name]
             rate = _success_rate(st)
             remaining = (st.open_until or now) - now
             return (
@@ -248,7 +264,7 @@ def engine_health_stats() -> dict[str, dict[str, Any]]:
         names = list(KNOWN_ENGINES) + sorted(set(_STATES) - set(KNOWN_ENGINES))
         stats: dict[str, dict[str, Any]] = {}
         for name in names:
-            st = _state(name)
+            st = _snapshot(name)
             state = _derive(st, now)
             stats[name] = {
                 "state": state,
@@ -275,16 +291,24 @@ def engine_health_stats() -> dict[str, dict[str, Any]]:
         return stats
 
 
+# Phrases that are unambiguous block signals wherever they appear.
 _BLOCK_MARKERS = (
     "/sorry/",
     "captcha",
     "unusual traffic",
     "are you a robot",
     "access denied",
-    "403",
-    "429",
     "too many requests",
-    "rate limit",
+)
+
+# 403/429 count only with real HTTP-status context ("HTTP 429", "status_code=403",
+# "403 Forbidden"). Bare digit substrings appear in URLs, ports and byte counts,
+# and a false blocked verdict carries BLOCK_WEIGHT — it benches a healthy engine.
+# Separators exclude "/" and "-" on purpose so URL paths never bridge the gap.
+_BLOCK_STATUS_RE = re.compile(
+    r"\b(?:http(?:/[\d.]+)?|status(?:[\s_-]?code)?|error|response|code)\b[ \t:=]{1,3}(?:403|429)\b"
+    r"|\b403[ \t]+forbidden\b"
+    r"|\brate[\s_-]?limit"
 )
 
 
@@ -292,7 +316,10 @@ def is_block_signal(exc: BaseException | None = None, *, text: str | None = None
     """Heuristic: does this failure look like a bot wall rather than a flake?
 
     Lets call sites map an exception (or a page URL / body snippet) onto the
-    ``blocked=True`` fast trip without duplicating the marker list.
+    ``blocked=True`` fast trip without duplicating the marker list. 403/429 need
+    surrounding HTTP-status wording — incidental digits never count.
     """
     haystack = " ".join(part for part in (str(exc) if exc is not None else None, text) if part).lower()
-    return any(marker in haystack for marker in _BLOCK_MARKERS)
+    if not haystack:
+        return False
+    return any(marker in haystack for marker in _BLOCK_MARKERS) or _BLOCK_STATUS_RE.search(haystack) is not None

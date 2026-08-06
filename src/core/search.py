@@ -53,7 +53,7 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
     # path is the difference between a blip and an outage.
     # NB: hit/miss counters are published at scrape time from the cache's own
     # totals (metrics.set_cache_stats); incrementing here too would double count.
-    from src.core.cache import get_cached, set_cached
+    from src.core.cache import get_cached, get_or_compute
     from src.observability import metrics
 
     cached = await get_cached(req.query, req.engine.value, req.depth, req.max_results)
@@ -206,15 +206,37 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
                 depth=req.depth,
             ),
         )
-        # Only cache productive answers — caching an empty SERP would pin a
-        # transient block/CAPTCHA in place for the whole TTL.
-        if results:
-            await set_cached(req.query, req.engine.value, req.depth, req.max_results,
-                             response.model_dump(mode="json"))
         return response
 
+    # Single-flight: a burst of identical cold queries (the common LLM-client
+    # pattern) elects ONE leader to scrape while the duplicates wait on its
+    # result, instead of each burning a browser tab on the same work.
+    # get_or_compute stores the payload, so _inner no longer caches directly.
+    leader_response: SearchResponse | None = None
+
+    async def _compute() -> dict | None:
+        nonlocal leader_response
+        leader_response = await asyncio.wait_for(_inner(), timeout=total_timeout)
+        # Returning None for an empty SERP keeps the "never cache a block"
+        # rule — followers still get released, just with nothing to reuse.
+        return leader_response.model_dump(mode="json") if leader_response.results else None
+
     try:
-        return await asyncio.wait_for(_inner(), timeout=total_timeout)
+        payload = await get_or_compute(
+            req.query, req.engine.value, req.depth, req.max_results, _compute,
+        )
+        if payload is not None:
+            return SearchResponse.model_validate(payload)
+        if leader_response is not None:
+            return leader_response  # we were the leader; empty but authoritative
+        # Follower of a leader that found nothing — mirror that empty answer.
+        return SearchResponse(
+            query=req.query, engine=req.engine, depth=req.depth, total=0, results=[],
+            metadata=SearchMetadata(
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+                engine=req.engine, depth=req.depth,
+            ),
+        )
     except asyncio.TimeoutError:
         elapsed = int((time.monotonic() - start) * 1000)
         metrics.record_search(req.engine.value, "timeout", elapsed / 1000)

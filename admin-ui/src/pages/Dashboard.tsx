@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react'
-import { api, type Stats, type SearchLog, type SystemInfo, type Analytics, type DbHealth, type TabsInfo } from '@/lib/api'
+import {
+  api, type Stats, type SearchLog, type SystemInfo, type Analytics, type DbHealth, type TabsInfo,
+  type PerfStats, type PerfSectionError, type EngineHealth,
+} from '@/lib/api'
 import {
   Search, Key, ShieldBan, Activity, Monitor, Globe,
   TrendingUp, Zap, BarChart3, Database, Cpu, CheckCircle2, XCircle, Layers,
+  HardDrive, CircuitBoard, Timer, Trash2,
 } from 'lucide-react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
@@ -30,6 +34,27 @@ function Gauge({ value, color, size = 56 }: { value: number; color: string; size
   )
 }
 
+/* ── /perf section helpers ── */
+function isPerfError(section: unknown): section is PerfSectionError {
+  return (
+    typeof section === 'object' && section !== null &&
+    typeof (section as PerfSectionError).error === 'string'
+  )
+}
+
+function breakerBadge(state?: string): { background: string; color: string } {
+  switch (state) {
+    case 'closed': return { background: 'rgba(52,199,89,0.1)', color: 'var(--accent-green)' }
+    case 'half_open': return { background: 'rgba(255,149,0,0.1)', color: 'var(--accent-orange)' }
+    case 'open': return { background: 'rgba(255,59,48,0.1)', color: 'var(--accent-red)' }
+    default: return { background: 'rgba(0,0,0,0.05)', color: 'var(--text-tertiary)' }
+  }
+}
+
+function fmtCount(v: number | null | undefined): string {
+  return v != null ? v.toLocaleString() : '—'
+}
+
 /* ── Custom chart tooltip ── */
 function GlassTooltip({ active, payload, label, suffix = '' }: any) {
   if (!active || !payload?.length) return null
@@ -52,6 +77,8 @@ export default function Dashboard() {
   const [analytics, setAnalytics] = useState<Analytics | null>(null)
   const [dbHealth, setDbHealth] = useState<DbHealth | null>(null)
   const [tabs, setTabs] = useState<TabsInfo | null>(null)
+  const [perf, setPerf] = useState<PerfStats | null>(null)
+  const [clearingCache, setClearingCache] = useState(false)
   const [timeRange, setTimeRange] = useState<'24h' | '7d'>('24h')
   const [error, setError] = useState('')
 
@@ -62,11 +89,13 @@ export default function Dashboard() {
     api.getAnalytics(24).then(setAnalytics).catch(() => {})
     api.getDbHealth().then(setDbHealth).catch(() => {})
     api.getTabs().then(setTabs).catch(() => {})
+    api.getPerf().then(setPerf).catch(() => {})
 
     const sysInterval = setInterval(() => {
       api.getSystem().then(setSystemInfo).catch(() => {})
       api.getDbHealth().then(setDbHealth).catch(() => {})
       api.getTabs().then(setTabs).catch(() => {})
+      api.getPerf().then(setPerf).catch(() => {})
     }, 10000)
     const analyticsInterval = setInterval(() => {
       const hours = timeRange === '7d' ? 168 : 24
@@ -103,6 +132,36 @@ export default function Dashboard() {
   const successColor = successRate === null ? 'var(--text-tertiary)'
     : successRate >= 95 ? 'var(--accent-green)'
     : successRate >= 80 ? 'var(--accent-orange)' : 'var(--accent-red)'
+
+  // /perf sections: each is stats, {error} (collector threw) or undefined (not loaded)
+  const rawCache = perf?.cache
+  const cache = rawCache && !isPerfError(rawCache) ? rawCache : null
+  const cacheError = rawCache && isPerfError(rawCache) ? rawCache.error : null
+  const rawEngines = perf?.engines
+  const engines = rawEngines && !isPerfError(rawEngines) ? rawEngines : null
+  const enginesError = rawEngines && isPerfError(rawEngines) ? rawEngines.error : null
+  const rawRateLimit = perf?.rate_limit
+  const rateLimit = rawRateLimit && !isPerfError(rawRateLimit) ? rawRateLimit : null
+  const rateLimitError = rawRateLimit && isPerfError(rawRateLimit) ? rawRateLimit.error : null
+
+  const engineRows: [string, EngineHealth][] = engines ? Object.entries(engines) : []
+  const openEngines = engineRows.filter(([, e]) => e?.state === 'open').length
+  const hitRatePct = (cache?.hit_rate ?? 0) * 100
+  const hitRateColor = hitRatePct >= 60 ? 'var(--accent-green)'
+    : hitRatePct >= 25 ? 'var(--accent-orange)' : 'var(--accent-red)'
+  const throttledTotal = rateLimit?.throttled_total ?? 0
+
+  const clearCache = async () => {
+    setClearingCache(true)
+    try {
+      await api.clearCache()
+      setPerf(await api.getPerf())
+    } catch {
+      // keep the last snapshot; next poll refreshes anyway
+    } finally {
+      setClearingCache(false)
+    }
+  }
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -279,6 +338,158 @@ export default function Dashboard() {
               ))}
             </div>
           ) : <p className="text-sm" style={{ color: 'var(--text-tertiary)' }}>Loading…</p>}
+        </div>
+      </div>
+
+      {/* Search performance — cache / engine circuit breakers / rate limiting */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Search cache */}
+        <div className="glass p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <HardDrive className="h-5 w-5" style={{ color: 'var(--accent-green)' }} />
+            <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Search Cache</h2>
+            {cache && cache.enabled === false && (
+              <span className="glass-badge" style={{ background: 'rgba(0,0,0,0.05)', color: 'var(--text-tertiary)' }}>
+                disabled
+              </span>
+            )}
+            {cache && (
+              <button onClick={clearCache} disabled={clearingCache}
+                className="glass-btn glass-btn-ghost ml-auto px-2.5 py-1 text-xs flex items-center gap-1"
+                style={{ color: 'var(--accent-red)', opacity: clearingCache ? 0.5 : 1 }}>
+                <Trash2 className="h-3 w-3" />
+                {clearingCache ? 'Clearing…' : 'Clear'}
+              </button>
+            )}
+          </div>
+          {cache ? (
+            <>
+              <div className="flex items-end gap-2 mb-3">
+                <p className="text-4xl font-bold tracking-tight" style={{ color: hitRateColor }}>
+                  {hitRatePct.toFixed(1)}%
+                </p>
+                <p className="text-sm font-medium pb-1" style={{ color: 'var(--text-secondary)' }}>hit rate</p>
+              </div>
+              <div className="grid grid-cols-1 gap-y-2.5 text-sm">
+                {[
+                  ['Hits / Misses', `${fmtCount(cache.hits)} / ${fmtCount(cache.misses)}`],
+                  ['Entries', `${fmtCount(cache.size)} / ${fmtCount(cache.max_size)}`],
+                  ['TTL', cache.ttl != null ? `${cache.ttl}s` : '—'],
+                  ['Backend', cache.backend ?? '—'],
+                  ...(cache.inflight != null ? [['In-flight', String(cache.inflight)]] : []),
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between border-b py-1" style={{ borderColor: 'rgba(0,0,0,0.04)' }}>
+                    <span style={{ color: 'var(--text-tertiary)' }}>{k}</span>
+                    <span className="font-mono font-medium" style={{ color: 'var(--text-primary)' }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="text-sm py-4 text-center" style={{ color: 'var(--text-tertiary)' }}>
+              {cacheError ? `Stats unavailable: ${cacheError}` : 'Loading…'}
+            </p>
+          )}
+        </div>
+
+        {/* Engine circuit breakers */}
+        <div className="glass p-5 lg:col-span-2">
+          <div className="flex items-center gap-2 mb-4">
+            <CircuitBoard className="h-5 w-5" style={{ color: 'var(--accent-purple)' }} />
+            <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Engine Health</h2>
+            {openEngines > 0 && (
+              <span className="glass-badge ml-auto" style={{ background: 'rgba(255,59,48,0.1)', color: 'var(--accent-red)' }}>
+                {openEngines} circuit-broken
+              </span>
+            )}
+          </div>
+          {engineRows.length > 0 ? (
+            <table className="glass-table">
+              <thead>
+                <tr><th>Engine</th><th>State</th><th>Fails</th><th>EWMA</th><th>Success</th><th>Cooldown</th></tr>
+              </thead>
+              <tbody>
+                {engineRows.map(([name, e]) => (
+                  <tr key={name}>
+                    <td className="font-medium">{name}</td>
+                    <td>
+                      <span className="glass-badge" style={breakerBadge(e?.state)}>{e?.state ?? 'unknown'}</span>
+                    </td>
+                    <td className="font-mono text-xs"
+                        style={{ color: (e?.consecutive_failures ?? 0) > 0 ? 'var(--accent-orange)' : 'var(--text-secondary)' }}>
+                      {e?.consecutive_failures ?? 0}
+                    </td>
+                    <td style={{ color: 'var(--text-secondary)' }}>
+                      {e?.ewma_latency_ms != null ? `${Math.round(e.ewma_latency_ms)}ms` : '—'}
+                    </td>
+                    <td style={{ color: 'var(--text-secondary)' }}>
+                      {e?.success_rate != null ? `${(e.success_rate * 100).toFixed(0)}%` : '—'}
+                    </td>
+                    <td style={{ color: e?.state === 'open' ? 'var(--accent-red)' : 'var(--text-tertiary)' }}>
+                      {e?.state === 'open' && e?.cooldown_remaining_s != null ? `${Math.ceil(e.cooldown_remaining_s)}s` : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-sm py-4 text-center" style={{ color: 'var(--text-tertiary)' }}>
+              {enginesError ? `Stats unavailable: ${enginesError}` : perf ? 'No engine data yet' : 'Loading…'}
+            </p>
+          )}
+        </div>
+
+        {/* Rate limiting */}
+        <div className="glass p-5 lg:col-span-3">
+          <div className="flex items-center gap-2 mb-4">
+            <Timer className="h-5 w-5" style={{ color: 'var(--accent-orange)' }} />
+            <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>Rate Limiting</h2>
+            {rateLimit && (
+              <span className="glass-badge ml-auto" style={{
+                background: rateLimit.enabled ? 'rgba(52,199,89,0.1)' : 'rgba(0,0,0,0.05)',
+                color: rateLimit.enabled ? 'var(--accent-green)' : 'var(--text-tertiary)',
+              }}>{rateLimit.enabled ? 'enabled' : 'disabled'}</span>
+            )}
+          </div>
+          {rateLimit ? (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div>
+                <p className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>Throttled</p>
+                <p className="text-2xl font-bold mt-1"
+                   style={{ color: throttledTotal > 0 ? 'var(--accent-orange)' : 'var(--text-primary)' }}>
+                  {throttledTotal.toLocaleString()}
+                </p>
+              </div>
+              <div>
+                <p className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>Active Buckets</p>
+                <p className="text-2xl font-bold mt-1" style={{ color: 'var(--text-primary)' }}>
+                  {fmtCount(rateLimit.active_buckets)}
+                  <span className="text-sm font-medium ml-1" style={{ color: 'var(--text-tertiary)' }}>
+                    / {fmtCount(rateLimit.max_buckets)}
+                  </span>
+                </p>
+              </div>
+              <div>
+                <p className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>Rate</p>
+                <p className="text-2xl font-bold mt-1" style={{ color: 'var(--text-primary)' }}>
+                  {rateLimit.rps != null ? `${rateLimit.rps}/s` : '—'}
+                  <span className="text-sm font-medium ml-1" style={{ color: 'var(--text-tertiary)' }}>
+                    burst {fmtCount(rateLimit.burst)}
+                  </span>
+                </p>
+              </div>
+              <div>
+                <p className="text-[13px] font-medium" style={{ color: 'var(--text-secondary)' }}>Concurrency</p>
+                <p className="text-2xl font-bold mt-1" style={{ color: 'var(--text-primary)' }}>
+                  {fmtCount(rateLimit.concurrency)}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm py-4 text-center" style={{ color: 'var(--text-tertiary)' }}>
+              {rateLimitError ? `Stats unavailable: ${rateLimitError}` : 'Loading…'}
+            </p>
+          )}
         </div>
       </div>
 

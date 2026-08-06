@@ -42,6 +42,8 @@ export const api = {
     }),
   getDbHealth: () => request<DbHealth>('/db-health'),
   getTabs: () => request<TabsInfo>('/tabs'),
+  getPerf: () => request<PerfStats>('/perf'),
+  clearCache: () => request<{ ok: boolean; cleared: number }>('/cache', { method: 'DELETE' }),
   getBans: () => request<IPBan[]>('/ip-bans'),
   banIP: (data: { ip: string; reason: string }) =>
     request<IPBan>('/ip-bans', { method: 'POST', body: JSON.stringify(data) }),
@@ -196,4 +198,82 @@ export interface ProxyTestResult {
   ok: boolean
   latency_ms: number
   error: string | null
+}
+
+/* --- /perf: search cache + engine circuit breakers + rate limiting --- */
+
+/** Each /perf section degrades to `{ error }` when its stats collector throws. */
+export interface PerfSectionError {
+  error: string
+}
+
+// All fields optional: the panel must survive older/newer backends omitting keys.
+export interface CachePerf {
+  enabled?: boolean
+  backend?: string // "memory" | "memory+redis"
+  hits?: number
+  memory_hits?: number
+  redis_hits?: number
+  misses?: number
+  hit_rate?: number // 0..1
+  size?: number
+  max_size?: number
+  ttl?: number // seconds
+  sets?: number
+  evictions?: number
+  expired?: number
+  errors?: number
+  inflight?: number // only on backends with request coalescing
+  coalesced?: number // callers served off an in-flight compute rather than a fresh one
+}
+
+export type BreakerState = 'closed' | 'open' | 'half_open'
+
+export interface EngineHealth {
+  state?: BreakerState
+  consecutive_failures?: number
+  failure_score?: number
+  open_streak?: number
+  cooldown_s?: number
+  cooldown_remaining_s?: number // 0 unless state == "open"
+  probe_in_flight?: boolean
+  last_outcome?: 'success' | 'error' | 'blocked' | null
+  last_outcome_at?: number | null // monotonic clock — only useful relative
+  last_outcome_age_s?: number | null
+  ewma_latency_ms?: number | null
+  success_rate?: number | null // 0..1 over the sample window
+  samples?: number
+  totals?: { success?: number; error?: number; blocked?: number }
+}
+
+export interface RateLimitBucket {
+  key?: string
+  tokens?: number
+  inflight?: number
+  allowed?: number
+  throttled?: number
+  idle_s?: number
+  day_count?: number
+  month_count?: number
+}
+
+export interface RateLimitPerf {
+  enabled?: boolean
+  rps?: number
+  burst?: number
+  concurrency?: number
+  daily_quota?: number // 0 = unlimited
+  monthly_quota?: number // 0 = unlimited
+  idle_ttl?: number
+  active_buckets?: number
+  max_buckets?: number
+  throttled_total?: number
+  reaped_total?: number
+  keys?: RateLimitBucket[] // hottest buckets, capped server-side
+}
+
+export interface PerfStats {
+  cache?: CachePerf | PerfSectionError
+  engines?: Record<string, EngineHealth> | PerfSectionError
+  rate_limit?: RateLimitPerf | PerfSectionError
 }

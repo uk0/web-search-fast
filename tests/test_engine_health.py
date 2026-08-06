@@ -135,16 +135,21 @@ def test_cooldown_growth_caps_at_max(clock: FakeClock) -> None:
 
 
 def test_long_outage_does_not_overflow_the_backoff(clock: FakeClock) -> None:
-    """An engine down for weeks must keep tripping, not raise OverflowError."""
+    """An engine down for weeks must keep tripping, not raise OverflowError.
+
+    2_000 trips is far past the naive float-pow overflow point (2.0 ** 1024);
+    the cooldown must saturate at MAX_COOLDOWN_S with no exception.
+    """
     for _ in range(3):
         record_failure("google")
-    for _ in range(1_100):
-        clock.advance(engine_health_stats()["google"]["cooldown_s"] + 1)
-        assert should_skip("google") is False
-        record_failure("google")
+    for _ in range(2_000):
+        clock.advance(MAX_COOLDOWN_S + 1)  # always past any possible cooldown
+        assert should_skip("google") is False  # half-open probe admitted
+        record_failure("google")  # probe fails -> trips again, one step longer
     stats = engine_health_stats()["google"]
     assert stats["state"] == "open"
     assert stats["cooldown_s"] == MAX_COOLDOWN_S
+    assert stats["open_streak"] == 2_001  # initial trip + 2000 failed probes
 
 
 def test_stale_probe_lease_is_reclaimed(clock: FakeClock) -> None:
@@ -239,9 +244,50 @@ def test_stats_shape(clock: FakeClock) -> None:
     assert stats["bing"]["success_rate"] is None
 
 
-def test_is_block_signal() -> None:
+def test_read_paths_do_not_grow_state_map() -> None:
+    """order_engines / should_skip / engine_health_stats never insert state.
+
+    Only record_success / record_failure may create entries — a read path that
+    mutates the global map is a leak for every unknown name it is shown.
+    """
+    from src.engine import health
+
+    fakes = [f"engine-{i}" for i in range(500)]
+    for name in fakes:
+        assert should_skip(name) is False
+    chain = order_engines(fakes[0], fakes[1:])
+    assert chain[0] == fakes[0]  # ranking still works for unknown names
+    assert set(engine_health_stats()) == {"google", "bing", "duckduckgo"}
+    assert health._STATES == {}  # no read created state
+
+    # Write paths still create state on demand.
+    record_failure("engine-0")
+    record_success("engine-1", 100.0)
+    assert set(health._STATES) == {"engine-0", "engine-1"}
+
+
+def test_is_block_signal_true_positives() -> None:
     assert is_block_signal(RuntimeError("redirected to https://www.google.com/sorry/index"))
     assert is_block_signal(text="Our systems have detected unusual traffic")
+    assert is_block_signal(text="Please solve the CAPTCHA to continue")
+    assert is_block_signal(text="Access Denied")
     assert is_block_signal(RuntimeError("HTTP 429 Too Many Requests"))
-    assert not is_block_signal(RuntimeError("Timeout 10000ms exceeded"))
+    assert is_block_signal(RuntimeError("server replied: 403 Forbidden"))
+    assert is_block_signal(text="status code: 429")
+    assert is_block_signal(text="status_code=403")
+    assert is_block_signal(text="Error 403")
+    assert is_block_signal(RuntimeError("request rejected: rate-limited by upstream"))
+    assert is_block_signal(text="you are being rate limited")
+
+
+def test_is_block_signal_ignores_incidental_digits() -> None:
+    """Bare 403/429 inside URLs, ports or byte counts must not read as a block."""
     assert not is_block_signal()
+    assert not is_block_signal(RuntimeError("Timeout 10000ms exceeded"))
+    assert not is_block_signal(RuntimeError("nav to https://example.com/item/4033-review failed"))
+    assert not is_block_signal(RuntimeError("nav to https://example.com/p/403 timed out"))
+    assert not is_block_signal(text="downloaded 14293 bytes")
+    assert not is_block_signal(text="read 403 bytes from socket")
+    assert not is_block_signal(RuntimeError("connect ECONNREFUSED 10.4.2.9:4293"))
+    assert not is_block_signal(text="https://youtu.be/dQw4w9?t=429")
+    assert not is_block_signal(text="expected 429 results, got 12")
