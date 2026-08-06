@@ -42,6 +42,35 @@ FALLBACK_ORDER: dict[SearchEngine, list[SearchEngine]] = {
 
 async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
     """Execute a search with engine fallback and multi-depth crawling."""
+    start = time.monotonic()
+    total_timeout = req.timeout or 25
+    logger.info("[search] start: query=%r engine=%s depth=%d max_results=%d timeout=%ds",
+                req.query[:80], req.engine.value, req.depth, req.max_results, total_timeout)
+
+    # Cache lookup BEFORE the pool health gate. An identical query costs ~3-9s to
+    # re-scrape, and serving it needs no browser at all — so a warm cache keeps
+    # answering even while the browser pool is down/restarting. That degradation
+    # path is the difference between a blip and an outage.
+    # NB: hit/miss counters are published at scrape time from the cache's own
+    # totals (metrics.set_cache_stats); incrementing here too would double count.
+    from src.core.cache import get_cached, set_cached
+    from src.observability import metrics
+
+    cached = await get_cached(req.query, req.engine.value, req.depth, req.max_results)
+    if cached is not None:
+        elapsed = int((time.monotonic() - start) * 1000)
+        logger.info("[search] cache HIT in %dms — query=%r", elapsed, req.query[:60])
+        try:
+            response = SearchResponse.model_validate(cached)
+            # Stamp THIS request's timing/time — replaying the original values
+            # would date admin log rows up to a full TTL in the past.
+            response.metadata.elapsed_ms = elapsed
+            response.metadata.timestamp = datetime.now(timezone.utc).isoformat()
+            response.metadata.cached = True
+            return response
+        except Exception as exc:  # corrupt/stale payload — fall through to a live search
+            logger.warning("[search] cached payload unusable (%s), re-searching", exc)
+
     if not pool._started:
         # A prior browser launch/restart may have failed, leaving the pool
         # down. Try to bring it back before giving up so one bad launch
@@ -53,32 +82,6 @@ async def do_search(pool: BrowserPool, req: SearchRequest) -> SearchResponse:
             raise SearchError(f"Browser pool not initialized: {exc}") from exc
         if not pool._started:
             raise SearchError("Browser pool not initialized")
-
-    start = time.monotonic()
-    total_timeout = req.timeout or 25
-    logger.info("[search] start: query=%r engine=%s depth=%d max_results=%d timeout=%ds",
-                req.query[:80], req.engine.value, req.depth, req.max_results, total_timeout)
-
-    # Cache lookup first — an identical query costs ~3-9s to re-scrape, so a hit
-    # is the single biggest latency win available.
-    from src.core.cache import get_cached, set_cached
-    from src.observability import metrics
-
-    # NB: cache hit/miss counters are published at scrape time from the cache's
-    # own totals (metrics.set_cache_stats) — incrementing here too would double
-    # count, which the metrics module explicitly warns against.
-    cached = await get_cached(req.query, req.engine.value, req.depth, req.max_results)
-    if cached is not None:
-        elapsed = int((time.monotonic() - start) * 1000)
-        logger.info("[search] cache HIT in %dms — query=%r", elapsed, req.query[:60])
-        try:
-            response = SearchResponse.model_validate(cached)
-            # Report this request's own elapsed time, not the cached one.
-            response.metadata.elapsed_ms = elapsed
-            response.metadata.cached = True
-            return response
-        except Exception as exc:  # corrupt/stale payload — fall through to a live search
-            logger.warning("[search] cached payload unusable (%s), re-searching", exc)
 
     # Treat a SERP as "good enough" at half the requested results (min 3).
     # Below this, a sparse/blocked engine (e.g. Google on a shopping-heavy

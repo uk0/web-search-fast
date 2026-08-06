@@ -171,3 +171,38 @@ class TestEngineHealthSignals:
         req = SearchRequest(query="q", engine=SearchEngine.GOOGLE, max_results=5)
         await do_search(pool, req)
         assert eng_health.should_skip("google")  # hard block trips at once
+
+
+class TestCacheDegradation:
+    """A warm cache must keep serving while the browser pool is down."""
+
+    @pytest.mark.asyncio
+    @patch("src.core.search.crawl_results", new_callable=AsyncMock)
+    @patch("src.core.search.ENGINES")
+    @patch("src.core.search.FALLBACK_ORDER", {SearchEngine.DUCKDUCKGO: []})
+    async def test_cache_hit_served_when_pool_down(self, mock_engines, mock_crawl):
+        results = [SearchResult(title="R", url="https://e.com", snippet="s")]
+        engine = AsyncMock()
+        engine.search.return_value = results
+        mock_engines.__getitem__ = MagicMock(return_value=engine)
+        mock_crawl.side_effect = lambda pool, r, **kw: r
+        req = SearchRequest(query="warm me", engine=SearchEngine.DUCKDUCKGO, max_results=5)
+
+        # 1) populate the cache with a healthy pool
+        await do_search(_mock_pool(), req)
+
+        # 2) pool is now dead AND unrecoverable — the cache must still answer
+        dead = _mock_pool(started=False)
+        dead.restart = AsyncMock(side_effect=RuntimeError("browser launch failed"))
+        resp = await do_search(dead, req)
+        assert resp.metadata.cached is True
+        assert resp.total == 1
+        dead.restart.assert_not_awaited()  # never even needed the browser
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_still_fails_when_pool_down(self):
+        # No cached entry => the pool guard must still apply.
+        dead = _mock_pool(started=False)
+        dead.restart = AsyncMock(side_effect=RuntimeError("browser launch failed"))
+        with pytest.raises(SearchError, match="not initialized"):
+            await do_search(dead, SearchRequest(query="never cached", max_results=5))
