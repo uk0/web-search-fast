@@ -30,3 +30,6 @@ admin-ui/dist/
 proxy_socks5h_list.txt
 *_proxy_list*.txt
 
+
+# Quarantined junk from tidy-ups — recoverable, never pushed
+trash/
