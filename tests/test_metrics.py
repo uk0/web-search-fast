@@ -20,6 +20,7 @@ from src.observability.metrics import (
     MetricsRegistry,
     RequestIdFilter,
     RequestIDMiddleware,
+    _fmt_float,
     get_request_id,
     metrics_endpoint,
     new_request_id,
@@ -40,7 +41,7 @@ from src.observability.metrics import (
 )
 
 _LABEL_PAIR = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
-_UNESCAPE = {"n": "\n", "\\": "\\", '"': '"'}
+_UNESCAPE = {"n": "\n", "r": "\r", "\\": "\\", '"': '"'}
 
 
 @pytest.fixture(autouse=True)
@@ -278,6 +279,151 @@ async def test_track_search_records_outcome_and_latency():
     assert _find(samples, "wsm_search_requests_total", engine="duckduckgo", outcome="blocked")[0][2] == 1.0
     assert _find(samples, "wsm_search_requests_total", engine="google", outcome="timeout")[0][2] == 1.0
     assert _find(samples, "wsm_search_latency_seconds_count", engine="google")[0][2] == 1.0
+
+
+def test_counter_inc_rejects_non_finite_and_series_stays_intact():
+    c = Counter("t_nonfinite_total", "doc", ("k",))
+    c.inc(2.0, k="a")
+    c.inc(math.nan, k="a")
+    c.inc(math.inf, k="a")
+    assert c.value(k="a") == 2.0
+    with pytest.raises(ValueError):  # -Inf is negative first and foremost
+        c.inc(-math.inf, k="a")
+    assert c.value(k="a") == 2.0
+    reg = MetricsRegistry()
+    reg._get_or_create(c)
+    assert 't_nonfinite_total{k="a"} 2.0\n' in reg.render()
+
+
+def test_counter_sync_rejects_non_finite_and_keeps_baseline():
+    c = Counter("t_sync_nonfinite_total", "doc", ("cache",))
+    c.sync(10, cache="serp")
+    c.sync(math.nan, cache="serp")
+    c.sync(math.inf, cache="serp")
+    c.sync(-math.inf, cache="serp")
+    assert c.value(cache="serp") == 10.0
+    c.sync(14, cache="serp")  # delta still computed from the last good total
+    assert c.value(cache="serp") == 14.0
+
+
+def test_gauge_rejects_non_finite():
+    g = Gauge("t_gauge_nonfinite", "doc")
+    g.set(5.0)
+    g.set(math.nan)
+    g.set(math.inf)
+    g.set(-math.inf)
+    g.inc(math.nan)
+    g.dec(math.inf)
+    assert g.value() == 5.0
+
+
+def test_non_finite_drop_warns_once_per_family(caplog):
+    c = Counter("t_warn_once_total", "doc")
+    with caplog.at_level(logging.WARNING, logger="src.observability.metrics"):
+        c.inc(math.nan)
+        c.inc(math.inf)
+        c.inc(math.nan)
+    assert len([r for r in caplog.records if "t_warn_once_total" in r.getMessage()]) == 1
+    assert c.value() == 0.0
+
+
+def test_histogram_still_drops_nan_but_observes_inf():
+    h = Histogram("t_nan_hist_seconds", "doc", buckets=(1.0,))
+    h.observe(0.5)
+    h.observe(math.nan)
+    assert h.sample_count() == 1
+    assert h.sample_sum() == 0.5
+    h.observe(math.inf)  # unchanged semantics: +Inf lands in the +Inf bucket
+    assert h.sample_count() == 2
+
+
+def test_fmt_float_canonical_go_exponents():
+    # the reproduced defect: >= 1e10 rendered as 1e+010 instead of 1e+10
+    assert _fmt_float(1e10) == "1e+10"
+    assert _fmt_float(1.5e10) == "1.5e+10"
+    assert _fmt_float(1e12) == "1e+12"
+    assert _fmt_float(1e15) == "1e+15"
+    # single-digit exponents keep Go's two-digit zero padding
+    assert _fmt_float(1e6) == "1e+06"
+    assert _fmt_float(1e7) == "1e+07"
+    assert _fmt_float(12345678.9) == "1.23456789e+07"
+    # Python repr is already exponent-form at 1e16 and passes through untouched
+    assert _fmt_float(1e16) == "1e+16"
+    # special values per the exposition spec
+    assert _fmt_float(math.inf) == "+Inf"
+    assert _fmt_float(-math.inf) == "-Inf"
+    assert _fmt_float(math.nan) == "NaN"
+    # small values keep their existing plain rendering
+    assert _fmt_float(0.25) == "0.25"
+    assert _fmt_float(1.0) == "1.0"
+
+
+def test_large_counter_value_renders_canonically():
+    c = Counter("t_huge_total", "doc")
+    c.inc(1e10)
+    reg = MetricsRegistry()
+    reg._get_or_create(c)
+    payload = reg.render()
+    assert "t_huge_total 1e+10\n" in payload
+    assert _parse(payload)[2][0][2] == 1e10
+
+
+def test_carriage_return_in_label_value_is_escaped():
+    c = Counter("t_cr_total", "doc", ("raw",))
+    c.inc(raw="line1\rline2")
+    reg = MetricsRegistry()
+    reg._get_or_create(c)
+    payload = reg.render()
+    assert "\r" not in payload, "raw CR must never reach the exposition output"
+    assert 't_cr_total{raw="line1\\rline2"} 1.0\n' in payload
+    _, _, samples = _parse(payload)
+    assert samples[0][1]["raw"] == "line1\rline2"
+
+
+def test_histogram_reregistration_with_different_buckets_raises():
+    reg = MetricsRegistry()
+    h1 = reg.histogram("t_rereg_seconds", "doc", ("engine",), (0.1, 0.5, 1.0))
+    assert reg.histogram("t_rereg_seconds", "doc", ("engine",), (0.1, 0.5, 1.0)) is h1
+    # the +Inf tail is implicit — spelling it out is the same identity
+    assert reg.histogram("t_rereg_seconds", "doc", ("engine",), (0.1, 0.5, 1.0, math.inf)) is h1
+    with pytest.raises(ValueError, match="different buckets"):
+        reg.histogram("t_rereg_seconds", "doc", ("engine",), (0.25, 2.0))
+    # pre-existing shape conflicts still raise
+    with pytest.raises(ValueError, match="different shape"):
+        reg.counter("t_rereg_seconds", "doc", ("engine",))
+    with pytest.raises(ValueError, match="different shape"):
+        reg.histogram("t_rereg_seconds", "doc", ("other",), (0.1, 0.5, 1.0))
+
+
+def test_render_stays_valid_exposition_after_non_finite_attempts():
+    set_browser_pool_stats({"active_tabs": 4})
+    record_search("google", "success", 0.7)
+    record_search("google", "success", float("nan"))  # latency dropped, count kept
+    set_cache_stats(hits=3, misses=1, cache="page")
+    set_cache_stats(hits=math.inf, misses=math.nan, cache="page")  # both dropped
+    set_browser_pool_stats({"active_tabs": math.nan})
+
+    payload = render_metrics()
+    assert payload.endswith("\n")
+    helps, types, samples = _parse(payload)
+
+    for family in types:
+        assert family in helps
+        assert payload.count(f"# HELP {family} ") == 1
+        assert payload.count(f"# TYPE {family} ") == 1
+    for name, labels, value in samples:
+        assert math.isfinite(value), f"{name}{labels} rendered non-finite"
+
+    assert _find(samples, "wsm_search_requests_total", engine="google", outcome="success")[0][2] == 2.0
+    buckets = [v for _, _, v in _find(samples, "wsm_search_latency_seconds_bucket", engine="google")]
+    assert buckets == sorted(buckets), "buckets must stay cumulative and monotonic"
+    count = _find(samples, "wsm_search_latency_seconds_count", engine="google")[0][2]
+    total = _find(samples, "wsm_search_latency_seconds_sum", engine="google")[0][2]
+    assert buckets[-1] == count == 1.0
+    assert total == pytest.approx(0.7)
+    assert _find(samples, "wsm_cache_hits_total", cache="page")[0][2] == 3.0
+    assert _find(samples, "wsm_cache_misses_total", cache="page")[0][2] == 1.0
+    assert _find(samples, "wsm_browser_pool_active_tabs")[0][2] == 4.0
 
 
 def test_request_id_generation_normalization_and_scope():

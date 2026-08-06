@@ -69,7 +69,8 @@ def _fmt_float(value: float) -> str:
     # Go switches to exponent notation sooner than Python does.
     if value > 0 and dot > 6:
         mantissa = f"{s[0]}.{s[1:dot]}{s[dot + 1:]}".rstrip("0.")
-        return f"{mantissa}e+0{dot - 1}"
+        # Go pads the exponent to two digits minimum ("1e+07"), never more ("1e+10").
+        return f"{mantissa}e+{dot - 1:02d}"
     return s
 
 
@@ -78,7 +79,9 @@ def _escape_help(text: str) -> str:
 
 
 def _escape_label_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    # \r must not reach the output raw: the format is line-oriented and a bare CR
+    # corrupts the sample line for CRLF-normalizing consumers.
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
 
 
 def _sanitize_label_value(value: Any) -> str:
@@ -119,11 +122,22 @@ class _Metric:
         self.labelnames: tuple[str, ...] = tuple(labelnames)
         self._lock = threading.Lock()
         self._values: dict[tuple[str, ...], Any] = {}
+        self._non_finite_warned = False
         if not self.labelnames:
             self._values[()] = self._zero()
 
     def _zero(self) -> Any:
         return 0.0
+
+    def _drop_non_finite(self, value: float) -> bool:
+        """True when `value` is NaN/±Inf and must be dropped before it poisons
+        the series. Warns once per family; benign race on the flag."""
+        if math.isfinite(value):
+            return False
+        if not self._non_finite_warned:
+            self._non_finite_warned = True
+            logger.warning("[metrics] %s: dropped non-finite value %r (further drops are silent)", self.name, value)
+        return True
 
     def _key(self, labels: Mapping[str, Any]) -> tuple[str, ...]:
         """Build the series key. Caller must hold ``self._lock``."""
@@ -157,11 +171,15 @@ class Counter(_Metric):
         self._synced: dict[tuple[str, ...], float] = {}
 
     def inc(self, amount: float = 1.0, /, **labels: Any) -> None:
+        amount = float(amount)
         if amount < 0:
             raise ValueError("counter increments must be non-negative")
+        # NaN/+Inf would render this series non-finite forever; -Inf raised above.
+        if self._drop_non_finite(amount):
+            return
         with self._lock:
             key = self._key(labels)
-            self._values[key] = self._values.get(key, 0.0) + float(amount)
+            self._values[key] = self._values.get(key, 0.0) + amount
 
     def sync(self, total: float, /, **labels: Any) -> None:
         """Mirror an externally-owned running total (e.g. a cache's own stats).
@@ -170,6 +188,9 @@ class Counter(_Metric):
         total is added as a delta instead of dragging this counter backwards.
         """
         total = float(total)
+        # A non-finite total would corrupt both the series and the reset baseline.
+        if self._drop_non_finite(total):
+            return
         with self._lock:
             key = self._key(labels)
             previous = self._synced.get(key, 0.0)
@@ -198,13 +219,19 @@ class Gauge(_Metric):
     _type = "gauge"
 
     def set(self, value: float, /, **labels: Any) -> None:
+        value = float(value)
+        if self._drop_non_finite(value):
+            return
         with self._lock:
-            self._values[self._key(labels)] = float(value)
+            self._values[self._key(labels)] = value
 
     def inc(self, amount: float = 1.0, /, **labels: Any) -> None:
+        amount = float(amount)
+        if self._drop_non_finite(amount):
+            return
         with self._lock:
             key = self._key(labels)
-            self._values[key] = self._values.get(key, 0.0) + float(amount)
+            self._values[key] = self._values.get(key, 0.0) + amount
 
     def dec(self, amount: float = 1.0, /, **labels: Any) -> None:
         self.inc(-amount, **labels)
@@ -254,7 +281,9 @@ class Histogram(_Metric):
     def observe(self, value: float, /, **labels: Any) -> None:
         value = float(value)
         # A NaN would poison _sum forever; drop it rather than raise on a hot path.
+        # ±Inf stays observable: it lands in the +Inf bucket by design.
         if math.isnan(value):
+            self._drop_non_finite(value)
             return
         index = bisect_left(self.upper_bounds, value)
         with self._lock:
@@ -312,6 +341,13 @@ class MetricsRegistry:
                 return metric
             if type(existing) is not type(metric) or existing.labelnames != metric.labelnames:
                 raise ValueError(f"metric {metric.name!r} already registered with a different shape")
+            if (
+                isinstance(existing, Histogram)
+                and isinstance(metric, Histogram)
+                and existing.upper_bounds != metric.upper_bounds
+            ):
+                # Returning the original here would silently ignore the new buckets.
+                raise ValueError(f"metric {metric.name!r} already registered with different buckets")
             return existing
 
     def counter(self, name: str, documentation: str, labelnames: Sequence[str] = ()) -> Counter:
