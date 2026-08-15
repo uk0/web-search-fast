@@ -309,6 +309,11 @@ async def list_search_engines(
 # Browser automation tools — screenshots + scripted interaction
 # ---------------------------------------------------------------------------
 
+# Raw JPEG bytes a full-page capture should stay under. base64 inflates ~4/3, so
+# 700KB raw lands near 930KB on the wire — comfortably inside what the compiled
+# build handles and small enough not to swamp the model context.
+_SHOT_RAW_TARGET = 700_000
+
 
 @mcp.tool(
     name="screenshot_page",
@@ -354,6 +359,7 @@ async def screenshot_page(
     # emit the smaller image, hence a lower default quality and height cap here.
     # Callers who want more can raise quality/max_height explicitly.
     is_long = mode == "full_page"
+    user_sized = quality > 0 or max_height > 0  # explicit ask wins over auto-shrink
     quality = quality if quality > 0 else (50 if is_long else 80)
     max_height = max_height if max_height > 0 else (10_000 if is_long else None)
 
@@ -369,13 +375,31 @@ async def screenshot_page(
             # reports timed_out and we still capture.
             ready = await wait_until_ready(page, level=wait_until, timeout=8.0,
                                            selector=wait_for or None)
-            shot = await _a.wait_for(
-                capture_screenshot(page, mode=mode, selector=selector or None,
-                                   image_format=image_format,
-                                   quality=quality if image_format.lower() in ("jpeg", "jpg") else None,
-                                   max_height=max_height, timeout=18.0),
-                timeout=30.0 if is_long else 25.0,
-            )
+            is_jpeg = image_format.lower() in ("jpeg", "jpg")
+
+            async def _capture(q: int | None, mh: int | None):
+                return await _a.wait_for(
+                    capture_screenshot(page, mode=mode, selector=selector or None,
+                                       image_format=image_format,
+                                       quality=q if is_jpeg else None,
+                                       max_height=mh, timeout=18.0),
+                    timeout=30.0 if is_long else 25.0,
+                )
+
+            shot = await _capture(quality, max_height)
+            # Adaptive shrink. Without Pillow nothing can downscale after the
+            # fact, and an oversized payload is not merely wasteful: the
+            # compiled build fails outright on very large tool results
+            # (observed "coroutine raised StopIteration" at ~2MB base64 while
+            # ~940KB succeeded). Page weight varies hugely, so re-capture
+            # smaller rather than guess one default that fits every site.
+            if is_jpeg and is_long and not user_sized:
+                for q, mh in ((40, 8_000), (30, 6_000)):
+                    if len(shot.image) <= _SHOT_RAW_TARGET:
+                        break
+                    logger.info("[screenshot_page] %dKB over target — re-capturing at q%d/%dpx",
+                                len(shot.image) // 1024, q, mh)
+                    shot = await _capture(q, mh)
     except ValueError as exc:
         return [f"invalid request: {exc}"]
     except ScreenshotError as exc:
