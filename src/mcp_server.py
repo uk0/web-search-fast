@@ -306,6 +306,176 @@ async def list_search_engines(
 
 
 # ---------------------------------------------------------------------------
+# Browser automation tools — screenshots + scripted interaction
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="screenshot_page",
+    description=(
+        "Capture a screenshot of a web page. mode='viewport' grabs the visible area, "
+        "mode='full_page' captures the ENTIRE scrollable page as one long image "
+        "(auto-scrolls first so lazy-loaded content renders), and mode='element' "
+        "captures a single element given a CSS selector. Use this to see what a page "
+        "actually looks like — layout, charts, rendered UI — when text extraction is "
+        "not enough. Images are auto-compressed to stay small enough for the context."
+    ),
+)
+async def screenshot_page(
+    url: str,
+    mode: str = "viewport",
+    selector: str = "",
+    image_format: str = "jpeg",
+    full_page: bool = False,
+    ctx: Context = None,
+) -> list:
+    """Navigate to a URL and return a screenshot plus its metadata."""
+    import asyncio as _a
+
+    from src.scraper.mcp_image import fit_image_to_budget, to_mcp_image
+    from src.scraper.screenshot import ScreenshotError, capture_screenshot
+
+    if full_page and mode == "viewport":
+        mode = "full_page"  # convenience alias: full_page=True implies the long capture
+
+    # Payload defaults are mode-aware. A long page is enormous: measured
+    # 1696x15975 => 1.9MB raw / 2.6MB base64 at jpeg q80, which is a lot to push
+    # through MCP. q60 + a 12000px cap roughly halves it. Pillow is NOT installed,
+    # so no post-hoc downscaling is possible — the browser has to emit the smaller
+    # image itself. Truncation is reported honestly in the returned metadata.
+    is_long = mode == "full_page"
+    quality = 60 if is_long else 80
+    max_height = 12_000 if is_long else None
+
+    pool = await _pool_from_ctx(ctx)
+    try:
+        # load_images=True: screenshot tabs must actually render images, unlike
+        # search tabs where the resource blocker drops them for speed.
+        async with pool.acquire(label=f"shot:{url[:48]}", load_images=True) as page:
+            await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            shot = await _a.wait_for(
+                capture_screenshot(page, mode=mode, selector=selector or None,
+                                   image_format=image_format,
+                                   quality=quality if image_format.lower() in ("jpeg", "jpg") else None,
+                                   max_height=max_height, timeout=18.0),
+                timeout=30.0 if is_long else 25.0,
+            )
+    except ValueError as exc:
+        return [f"invalid request: {exc}"]
+    except ScreenshotError as exc:
+        return [f"screenshot failed: {exc}"]
+    except _a.TimeoutError:
+        return ["screenshot failed: timed out"]
+    except Exception as exc:
+        logger.exception("[screenshot_page] %s", url)
+        return [f"screenshot failed: {exc}"]
+
+    budgeted = await fit_image_to_budget(shot.image)
+    return [to_mcp_image(budgeted), f"{shot.meta()} | {budgeted.summary}"]
+
+
+@mcp.tool(
+    name="browser_actions",
+    description=(
+        "Run a SEQUENCE of browser actions on one page in a single call — the way to "
+        "drive a site without keeping a session open. Supply actions as a list of dicts, "
+        "e.g. [{'action':'click','selector':'#login'}, "
+        "{'action':'fill','selector':'#user','value':'bob'}, "
+        "{'action':'type_text','selector':'#q','text':'hello'}, "
+        "{'action':'press_key','key':'Enter'}, {'action':'wait_for','selector':'.result'}, "
+        "{'action':'get_text','selector':'h1'}]. Supported: navigate, click, double_click, "
+        "type_text, fill, press_key, hover, scroll, select_option, check, uncheck, wait_for, "
+        "go_back, go_forward, reload, get_text, get_attribute, element_exists. "
+        "Returns per-step results so you can see exactly what happened."
+    ),
+)
+async def browser_actions(
+    url: str,
+    actions: list,
+    continue_on_error: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Execute an action script against a freshly opened page."""
+    import json as _json
+
+    from src.scraper.actions import run_actions
+
+    pool = await _pool_from_ctx(ctx)
+    try:
+        async with pool.acquire(label=f"actions:{url[:40]}") as page:
+            await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            result = await run_actions(page, actions, timeout=20.0,
+                                       continue_on_error=continue_on_error)
+    except Exception as exc:
+        logger.exception("[browser_actions] %s", url)
+        return f"browser_actions failed: {exc}"
+    return _json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+@mcp.tool(
+    name="browser_session",
+    description=(
+        "Manage a PERSISTENT browser session when you need several tool calls to act on "
+        "the SAME page (click, then inspect, then screenshot). op='open' (with url) "
+        "returns a session_id; op='act' runs actions on it; op='screenshot' captures it; "
+        "op='close' releases it; op='list' shows open sessions. Sessions expire on their "
+        "own — always close one when done. For a one-shot flow prefer browser_actions, "
+        "which needs no session."
+    ),
+)
+async def browser_session(
+    op: str,
+    session_id: str = "",
+    url: str = "",
+    actions: list | None = None,
+    mode: str = "viewport",
+    selector: str = "",
+    ctx: Context = None,
+) -> list:
+    """Open / act on / screenshot / close a persistent browser session."""
+    import json as _json
+
+    from src.scraper.session import SessionError, get_session_manager
+
+    mgr = get_session_manager()
+    op = (op or "").strip().lower()
+    try:
+        if op == "open":
+            if not url:
+                return ["invalid request: 'open' needs a url"]
+            pool = await _pool_from_ctx(ctx)
+            sid = await mgr.open_session(pool, url=url)
+            return [_json.dumps({"session_id": sid, **(mgr.session_info(sid) or {})},
+                                ensure_ascii=False, default=str)]
+        if op == "list":
+            return [_json.dumps({"sessions": mgr.list_sessions(), "stats": mgr.stats()},
+                                ensure_ascii=False, default=str)]
+        if op == "close":
+            return [_json.dumps({"closed": await mgr.close_session(session_id)})]
+        if op == "act":
+            from src.scraper.actions import run_actions
+            page = await mgr.get_page(session_id)
+            result = await run_actions(page, actions or [], timeout=20.0)
+            return [_json.dumps(result, ensure_ascii=False, indent=2, default=str)]
+        if op == "screenshot":
+            from src.scraper.mcp_image import fit_image_to_budget, to_mcp_image
+            from src.scraper.screenshot import capture_screenshot
+            page = await mgr.get_page(session_id)
+            shot = await capture_screenshot(page, mode=mode, selector=selector or None,
+                                            image_format="jpeg", timeout=18.0)
+            budgeted = await fit_image_to_budget(shot.image)
+            return [to_mcp_image(budgeted), f"{shot.meta()} | {budgeted.summary}"]
+        return [f"invalid op {op!r}: use open | act | screenshot | close | list"]
+    except SessionError as exc:
+        return [f"session error: {exc}"]
+    except ValueError as exc:
+        return [f"invalid request: {exc}"]
+    except Exception as exc:
+        logger.exception("[browser_session] op=%s", op)
+        return [f"browser_session failed: {exc}"]
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 

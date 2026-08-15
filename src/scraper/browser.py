@@ -502,8 +502,12 @@ class BrowserPool:
             await self._push_stats()
 
     @asynccontextmanager
-    async def acquire(self, *, label: str | None = None, session: str | None = None) -> AsyncGenerator[Page, None]:
+    async def acquire(self, *, label: str | None = None, session: str | None = None,
+                      load_images: bool = False) -> AsyncGenerator[Page, None]:
         """Acquire a browser tab. Auto-scales and auto-restarts if needed.
+
+        ``load_images=True`` skips the resource blocker for this tab only —
+        screenshots need real images, while search tabs keep dropping them.
 
         When proxy rotation is enabled, creates a new browser context with
         a per-request proxy, ensuring each request uses a different proxy.
@@ -610,7 +614,8 @@ class BrowserPool:
                     context = await self._browser.new_context()  # type: ignore[union-attr]
                     page = await context.new_page()
 
-            await self._install_resource_blocker(page)
+            if not load_images:
+                await self._install_resource_blocker(page)
 
             open_ms = (time.monotonic() - t0) * 1000
             logger.info("[pool] req#%d — tab opened in %.0fms (semaphore slots: %d/%d)",

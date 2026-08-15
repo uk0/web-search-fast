@@ -25,7 +25,11 @@ class BrowserConfig(BaseModel):
     geoip: bool = Field(default=True, description="Enable GeoIP spoofing based on real IP")
     humanize: float = Field(default=0.5, ge=0, description="Humanized cursor movement duration (0 to disable)")
     locale: str = Field(default="en-US", description="Browser locale")
-    block_images: bool = Field(default=True, description="Block image loading for faster page loads")
+    # Launch-level image blocking is browser-WIDE and cannot be relaxed per tab,
+    # which would make every screenshot render placeholders. Leave it off and let
+    # the per-page resource blocker (block_resources) drop images for search tabs
+    # instead — same speed, but a screenshot tab can opt back in.
+    block_images: bool = Field(default=False, description="Block images at browser launch (browser-wide)")
     block_resources: bool = Field(
         default=True,
         description="Abort image/media/font requests via routing for faster page loads",
@@ -70,6 +74,10 @@ def get_config() -> AppConfig:
         browser_kwargs["block_resources"] = False
     elif block_res in ("1", "true", "yes"):
         browser_kwargs["block_resources"] = True
+    if (block_img := os.environ.get("BROWSER_BLOCK_IMAGES", "").lower()) in ("1", "true", "yes"):
+        browser_kwargs["block_images"] = True
+    elif block_img in ("0", "false", "no"):
+        browser_kwargs["block_images"] = False
     if (geo_fp := os.environ.get("BROWSER_GEO_FINGERPRINT", "").lower()) in ("0", "false", "no"):
         browser_kwargs["geo_fingerprint"] = False
     elif geo_fp in ("1", "true", "yes"):
