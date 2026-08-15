@@ -13,7 +13,10 @@ from src.scraper.screenshot import (
     capture_screenshot,
 )
 
-_BOTTOM_SCROLL = "scrollTo(0, document.body.scrollHeight)"
+# Pre-scroll steps one viewport at a time (scrollBy) rather than jumping to
+# scrollHeight: lazy images only fetch as they approach the viewport, so a
+# single jump left them blank (measured 0/40 decoded when jumping).
+_BOTTOM_SCROLL = "window.scrollBy(0, step)"
 _TOP_SCROLL = "scrollTo(0, 0)"
 
 
@@ -33,11 +36,22 @@ def _make_page(
     page.wait_for_timeout = AsyncMock(return_value=None)
     page.locator = Mock()  # sync in the real API
 
+    # Stateful scroll simulation: each scrollBy advances y by ~0.85 viewport
+    # until the document floor, mirroring the real stepped pre-scroll.
+    vh = (viewport or {"width": 1280, "height": 720})["height"]
+    pos = {"y": 0}
+
     def _eval(script: str, *args):
         if _BOTTOM_SCROLL in script:
-            return doc_h
+            pos["y"] = min(pos["y"] + int(vh * 0.85), max(0, doc_h - vh))
+            return {"y": pos["y"], "h": doc_h, "vh": vh}
+        if "scrollTo(0, 0)" in script:
+            pos["y"] = 0
+            return None
         if "scrollWidth" in script:
             return {"width": doc_w, "height": doc_h}
+        if "naturalWidth" in script:  # media settle
+            return {"total": 0, "settled": 0}
         return None
 
     page.evaluate = AsyncMock(side_effect=_eval)
@@ -278,3 +292,33 @@ async def test_real_png_dims_win_over_fallback():
 
     # Parsed from the bytes, not the 1280x720 viewport fallback.
     assert (result.width, result.height) == (321, 654)
+
+
+async def test_pre_scroll_steps_incrementally_not_one_jump():
+    """Lazy images only fetch as they near the viewport.
+
+    Jumping straight to document.scrollHeight skipped everything in between —
+    measured 0/40 images decoded. Stepping one viewport at a time fixed it, so
+    the pre-scroll must issue MULTIPLE incremental scrolls, never a single jump.
+    """
+    page = _make_page()
+    await capture_screenshot(page, mode="full_page", max_height=20_000, max_width=10_000)
+
+    scripts = _eval_scripts(page)
+    steps = [s for s in scripts if "scrollBy" in s]
+    assert len(steps) >= 2, f"expected repeated incremental scrolls, got {len(steps)}"
+    assert not any("scrollTo(0, document.body.scrollHeight)" in s for s in scripts), \
+        "must not jump straight to the bottom — that leaves lazy images unloaded"
+
+
+async def test_media_settle_waits_for_scroll_triggered_images():
+    """The scroll only STARTS lazy fetches; capturing at once photographs
+    half-decoded images as blank boxes, so we must wait for them."""
+    page = _make_page()
+    await capture_screenshot(page, mode="full_page", max_height=20_000, max_width=10_000)
+
+    scripts = _eval_scripts(page)
+    settle = [s for s in scripts if "loadeddata" in s or "naturalWidth" in s]
+    assert settle, "expected a media-settle wait after pre-scroll"
+    # and it must cover <video> too — an undecoded poster renders as a black box
+    assert any("video" in s for s in settle), "media settle should include <video>"

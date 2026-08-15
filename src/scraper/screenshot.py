@@ -64,8 +64,11 @@ _CAPTURE_RESERVE_SECS = 3.0
 
 # Pre-scroll tuning — mirrors the proven depth-crawl auto-scroll. Kept local
 # on purpose: depth.py is owned by another workstream.
-_SCROLL_MAX_STEPS = 12
+_SCROLL_MAX_STEPS = 24  # stepping one viewport at a time needs more steps than jumping
 _SCROLL_SETTLE_MS = 450
+# Cap on waiting for scroll-triggered images/videos to decode. A page whose media
+# never loads must not eat the whole capture budget.
+_MEDIA_SETTLE_MAX_SECS = 5.0
 
 _MEASURE_TIMEOUT_SECS = 5.0
 _PROBE_TIMEOUT_SECS = 5.0
@@ -209,23 +212,86 @@ async def _auto_scroll(page: Page, deadline: float) -> None:
     renders, then return to the top. Best-effort: any error ends scrolling."""
     try:
         prev_height: float = -1
+        at_bottom_rounds = 0
         for _ in range(_SCROLL_MAX_STEPS):
             if time.monotonic() >= deadline:
                 break
-            height = await page.evaluate(
-                "() => { window.scrollTo(0, document.body.scrollHeight); "
-                "return document.body.scrollHeight; }"
+            # Step down roughly one viewport at a time instead of jumping to
+            # scrollHeight. loading="lazy" images only start fetching when they
+            # approach the viewport, so a single jump to the bottom skips every
+            # image in between — measured 0/40 decoded when jumping vs stepping.
+            state = await page.evaluate(
+                "() => { const step = Math.max(200, Math.round(window.innerHeight * 0.85));"
+                " window.scrollBy(0, step);"
+                " return {y: window.scrollY, h: document.body.scrollHeight,"
+                "         vh: window.innerHeight}; }"
             )
             settle_ms = min(_SCROLL_SETTLE_MS, max(0, int((deadline - time.monotonic()) * 1000)))
             if settle_ms:
                 await page.wait_for_timeout(settle_ms)
-            if not isinstance(height, (int, float)) or height <= prev_height:
-                break  # no new content loaded
-            prev_height = height
+            if not isinstance(state, dict):
+                break
+            height = state.get("h", 0)
+            reached_bottom = state.get("y", 0) + state.get("vh", 0) >= height - 2
+            if reached_bottom:
+                # At the floor: give infinite-scroll a beat to append more. Stop
+                # once the document stops growing.
+                if height <= prev_height:
+                    at_bottom_rounds += 1
+                    if at_bottom_rounds >= 2:
+                        break
+                else:
+                    at_bottom_rounds = 0
+            prev_height = max(prev_height, height)
         # Back to the top so the capture starts at y=0 with a settled layout.
         await page.evaluate("() => window.scrollTo(0, 0)")
+        # The scroll above only STARTS the lazy fetches. Capturing now would
+        # photograph half-decoded images as blank boxes, so wait for the media
+        # the scroll just triggered to actually finish.
+        await _settle_media(page, deadline)
     except Exception as exc:
         logger.debug("[screenshot] pre-scroll skipped: %s", exc)
+
+
+# Resolves once every pending <img>/<video> has fired load/error, or the budget
+# expires — whichever first. Runs in the page so we wait on real decode events
+# rather than polling. Videos are included because a poster/first frame that has
+# not arrived renders as a black rectangle.
+_SETTLE_MEDIA_JS = """(budgetMs) => new Promise((resolve) => {
+  const imgs = Array.prototype.slice.call(document.querySelectorAll('img'))
+    .filter((el) => !el.complete || el.naturalWidth === 0);
+  const vids = Array.prototype.slice.call(document.querySelectorAll('video'))
+    .filter((el) => el.readyState < 2);
+  const pending = imgs.concat(vids);
+  const total = pending.length;
+  if (!total) { resolve({total: 0, settled: 0}); return; }
+  let left = total;
+  const done = () => { if (--left <= 0) { clearTimeout(t); resolve({total: total, settled: total}); } };
+  imgs.forEach((el) => {
+    el.addEventListener('load', done, {once: true});
+    el.addEventListener('error', done, {once: true});
+  });
+  vids.forEach((el) => {
+    el.addEventListener('loadeddata', done, {once: true});
+    el.addEventListener('error', done, {once: true});
+  });
+  const t = setTimeout(() => resolve({total: total, settled: total - left}), budgetMs);
+})"""
+
+
+async def _settle_media(page: Page, deadline: float) -> None:
+    """Wait for in-flight images/videos to decode, bounded by the deadline."""
+    budget = _remaining_secs(deadline, _MEDIA_SETTLE_MAX_SECS)
+    if budget <= 0.05:
+        return
+    try:
+        res = await asyncio.wait_for(
+            page.evaluate(_SETTLE_MEDIA_JS, int(budget * 1000)), timeout=budget + 0.5,
+        )
+        if isinstance(res, dict) and res.get("total"):
+            logger.debug("[screenshot] media settle: %s/%s", res.get("settled"), res.get("total"))
+    except Exception as exc:  # never fail a capture over media that won't load
+        logger.debug("[screenshot] media settle skipped: %s", exc)
 
 
 async def _measure_document(page: Page, deadline: float) -> tuple[int, int]:
