@@ -329,6 +329,8 @@ async def screenshot_page(
     full_page: bool = False,
     wait_until: str = "stable",
     wait_for: str = "",
+    quality: int = 0,
+    max_height: int = 0,
     ctx: Context = None,
 ) -> list:
     """Navigate to a URL and return a screenshot plus its metadata."""
@@ -346,9 +348,14 @@ async def screenshot_page(
     # through MCP. q60 + a 12000px cap roughly halves it. Pillow is NOT installed,
     # so no post-hoc downscaling is possible — the browser has to emit the smaller
     # image itself. Truncation is reported honestly in the returned metadata.
+    # Now that lazy media actually loads, a full page carries real photos and the
+    # payload grew accordingly (measured 2.7MB base64 on an image-heavy page).
+    # Pillow is absent so nothing can downscale after the fact — the browser must
+    # emit the smaller image, hence a lower default quality and height cap here.
+    # Callers who want more can raise quality/max_height explicitly.
     is_long = mode == "full_page"
-    quality = 60 if is_long else 80
-    max_height = 12_000 if is_long else None
+    quality = quality if quality > 0 else (50 if is_long else 80)
+    max_height = max_height if max_height > 0 else (10_000 if is_long else None)
 
     pool = await _pool_from_ctx(ctx)
     try:
