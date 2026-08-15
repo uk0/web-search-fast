@@ -327,12 +327,15 @@ async def screenshot_page(
     selector: str = "",
     image_format: str = "jpeg",
     full_page: bool = False,
+    wait_until: str = "stable",
+    wait_for: str = "",
     ctx: Context = None,
 ) -> list:
     """Navigate to a URL and return a screenshot plus its metadata."""
     import asyncio as _a
 
     from src.scraper.mcp_image import fit_image_to_budget, to_mcp_image
+    from src.scraper.readiness import wait_until_ready
     from src.scraper.screenshot import ScreenshotError, capture_screenshot
 
     if full_page and mode == "viewport":
@@ -353,6 +356,12 @@ async def screenshot_page(
         # search tabs where the resource blocker drops them for speed.
         async with pool.acquire(label=f"shot:{url[:48]}", load_images=True) as page:
             await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            # Screenshots are where readiness actually rescues a failure: without
+            # it a JS-rendered page captures a skeleton (measured 0 -> 10 results
+            # on an XHR-rendered page). Never fatal — a page that never goes idle
+            # reports timed_out and we still capture.
+            ready = await wait_until_ready(page, level=wait_until, timeout=8.0,
+                                           selector=wait_for or None)
             shot = await _a.wait_for(
                 capture_screenshot(page, mode=mode, selector=selector or None,
                                    image_format=image_format,
@@ -371,7 +380,9 @@ async def screenshot_page(
         return [f"screenshot failed: {exc}"]
 
     budgeted = await fit_image_to_budget(shot.image)
-    return [to_mcp_image(budgeted), f"{shot.meta()} | {budgeted.summary}"]
+    return [to_mcp_image(budgeted),
+            f"{shot.meta()} | {budgeted.summary} | ready={ready.ready} "
+            f"level={ready.level_reached} timed_out={ready.timed_out}"]
 
 
 @mcp.tool(
@@ -393,19 +404,30 @@ async def browser_actions(
     url: str,
     actions: list,
     continue_on_error: bool = False,
+    wait_until: str = "network",
+    wait_for: str = "",
     ctx: Context = None,
 ) -> str:
     """Execute an action script against a freshly opened page."""
     import json as _json
 
     from src.scraper.actions import run_actions
+    from src.scraper.readiness import wait_until_ready
 
     pool = await _pool_from_ctx(ctx)
     try:
         async with pool.acquire(label=f"actions:{url[:40]}") as page:
             await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            # Lighter than the screenshot gate: run_actions already waits per
+            # step, so this mainly front-loads the wait and covers actions with
+            # no implicit wait of their own (press_key, scroll). Pass wait_for
+            # when the element you need mounts late — a quiescence gate cannot
+            # see a render scheduled in the future, only a selector can.
+            ready = await wait_until_ready(page, level=wait_until, timeout=6.0,
+                                           selector=wait_for or None)
             result = await run_actions(page, actions, timeout=20.0,
                                        continue_on_error=continue_on_error)
+            result["readiness"] = ready.as_dict()
     except Exception as exc:
         logger.exception("[browser_actions] %s", url)
         return f"browser_actions failed: {exc}"
