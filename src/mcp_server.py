@@ -108,6 +108,35 @@ async def _shutdown_pool() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Obscura — the lightweight ("less") content-fetch backend, a separate service
+# reached over CDP. Kept as its own singleton so a down/absent obscura never
+# touches the Camoufox pool that the rest of the tools depend on.
+# ---------------------------------------------------------------------------
+
+_obscura_instance = None  # type: ignore[var-annotated]
+
+
+async def _ensure_obscura():
+    """Return the shared ObscuraPool, connecting on first use. Raises if the
+    obscura service is unreachable — callers fall back to Camoufox."""
+    global _obscura_instance
+    from src.scraper.obscura_pool import ObscuraPool
+
+    if _obscura_instance is None:
+        _obscura_instance = ObscuraPool()
+    await _obscura_instance.start()  # idempotent: no-op while connected
+    return _obscura_instance
+
+
+async def _shutdown_obscura() -> None:
+    global _obscura_instance
+    if _obscura_instance is not None:
+        await _obscura_instance.stop()
+        _obscura_instance = None
+        logger.info("ObscuraPool stopped")
+
+
+# ---------------------------------------------------------------------------
 # Lifespan — per-session, but pool is singleton so startup is instant
 # ---------------------------------------------------------------------------
 
@@ -230,36 +259,62 @@ async def web_search(
         return f"Error: {e}"
 
 
+_OBSCURA_ALIASES = {"obscura", "less", "lite", "light"}
+
+
 @mcp.tool(
     name="get_page_content",
     description=(
         "Fetch and read a single web page, extracting its main content as clean markdown. "
         "Use this to read full articles, documentation pages, blog posts, or any URL "
         "you already know. Ideal after web_search when you need the complete content "
-        "of a specific result, or when the user provides a URL to read."
+        "of a specific result, or when the user provides a URL to read. "
+        "backend='camoufox' (default) is the full stealth Firefox — best for JS-heavy "
+        "or protected pages. backend='obscura' is a lightweight engine — much faster and "
+        "cheaper for static / server-rendered pages, but it does not run SPA/XHR content; "
+        "it falls back to camoufox automatically if unavailable."
     ),
 )
 async def get_page_content(
     url: str,
+    backend: str = "camoufox",
     ctx: Context = None,
 ) -> str:
-    """Fetch and extract content from a specific URL."""
+    """Fetch and extract content from a specific URL via the chosen backend."""
     import time as _t
     t0 = _t.monotonic()
-    logger.info("[get_page_content] called: url=%r", url)
+    want_obscura = (backend or "").strip().lower() in _OBSCURA_ALIASES
+    logger.info("[get_page_content] called: url=%r backend=%s", url, "obscura" if want_obscura else "camoufox")
 
     from src.core.search import fetch_url_content
 
-    pool = await _pool_from_ctx(ctx)
-
+    note = ""
     try:
-        content = await fetch_url_content(pool, url, timeout=20)
+        if want_obscura:
+            try:
+                pool = await _ensure_obscura()
+                content = await fetch_url_content(pool, url, timeout=20)
+                used = "obscura"
+            except Exception as exc:
+                # Never fail the read because the lightweight backend is down —
+                # fall back to Camoufox and say so in the output.
+                logger.warning("[get_page_content] obscura unavailable (%s) — falling back to camoufox",
+                               str(exc)[:120])
+                note = "> _obscura backend unavailable — served via camoufox_\n\n"
+                pool = await _pool_from_ctx(ctx)
+                content = await fetch_url_content(pool, url, timeout=20)
+                used = "camoufox(fallback)"
+        else:
+            pool = await _pool_from_ctx(ctx)
+            content = await fetch_url_content(pool, url, timeout=20)
+            used = "camoufox"
+
         elapsed = (_t.monotonic() - t0) * 1000
         if not content:
-            logger.warning("[get_page_content] empty content from %s (%.0fms)", url, elapsed)
+            logger.warning("[get_page_content] empty content from %s via %s (%.0fms)", url, used, elapsed)
             return f"Could not extract content from {url}"
-        logger.info("[get_page_content] done in %.0fms, %d chars", elapsed, len(content))
-        return f"# Content from {url}\n\n{content}"
+        logger.info("[get_page_content] done in %.0fms, %d chars via %s", elapsed, len(content), used)
+        return f"# Content from {url}\n\n{note}{content}"
     except Exception as e:
         logger.exception("[get_page_content] error fetching %s", url)
         return f"Error fetching {url}: {e}"
@@ -294,6 +349,19 @@ async def list_search_engines(
     ]
     for engine_enum, engine_impl in ENGINES.items():
         lines.append(f"- **{engine_enum.value}** ({engine_impl.__class__.__name__})")
+    # Page-fetch backends (used by get_page_content)
+    lines.extend(["", "## Page-fetch backends", ""])
+    lines.append("- **camoufox** (sim): full stealth Firefox — default, JS/interactive/screenshots")
+    try:
+        obs = await _ensure_obscura()
+        os_stats = obs.stats
+        state = "connected" if os_stats.get("connected") else "unreachable"
+        lines.append(f"- **obscura** (less): lightweight CDP engine — {state}, "
+                     f"static/SSR pages only (no SPA/XHR, no screenshots)")
+    except Exception:
+        lines.append("- **obscura** (less): lightweight CDP engine — unreachable "
+                     "(get_page_content falls back to camoufox)")
+
     lines.extend([
         "",
         "## Notes",
@@ -605,6 +673,7 @@ def main() -> None:
                     yield state
             finally:
                 await _shutdown_pool()
+                await _shutdown_obscura()
                 await close_cache_redis()
                 await close_db()
 
